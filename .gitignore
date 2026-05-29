@@ -1,0 +1,61 @@
+# --- Keil uVision / MDK ---
+*.uvguix.*
+*.uvoptx
+*.uvprojx
+*.scvd
+*.dbgdt
+*.uvlprojx
+*.CRF
+*.d
+*.o
+*.axf
+*.htm
+*.lnp
+*.sct
+*.lst
+*.map
+*.dep
+*.iex
+*.tra
+*.O
+*.build_log.htm
+*.lst
+*.elf
+*.bin
+*.hex
+
+# JLink / ST-Link
+JLinkLog.txt
+*.jlink
+
+# --- Debug / Simulation ---
+*.ini
+# Keep system_gd32f30x.ini if needed (you might want to track it)
+# !system_gd32f30x.ini
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Build output ---
+Output/
+Listings/
+Objects/
+RTE/
+build/
+Debug/
+Release/
+
+# --- User specific files ---
+*.uvguix.*
+*.bak
+*.tmp
+
+# --- Tools / Data ---
+tools/
+doc/
