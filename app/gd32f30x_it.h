@@ -4,8 +4,6 @@
 #include "gd32f30x.h"
 #include <stdint.h>
 
-extern volatile uint32_t SystickCount;
-
 void NMI_Handler(void);
 void HardFault_Handler(void);
 void MemManage_Handler(void);

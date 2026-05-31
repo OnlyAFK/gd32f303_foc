@@ -1,0 +1,143 @@
+#ifndef FOC_CORE_H
+#define FOC_CORE_H
+
+#include <stdint.h>
+#include "foc_math.h"
+#include "pid.h"
+#include "pll.h"
+#include "svpwm.h"
+#include "motor_hw.h"
+
+/* Top-level control state machine. */
+typedef enum {
+  FOC_STATE_IDLE = 0,        /* outputs off, no drive */
+  FOC_STATE_CALI,            /* current-offset + encoder zero alignment */
+  FOC_STATE_OPENLOOP_VOLT,   /* voltage at an internally ramped angle (no encoder) */
+  FOC_STATE_CLOSEDLOOP_VOLT, /* voltage in the dq frame at the measured angle */
+  FOC_STATE_CURRENT,         /* id/iq current loop */
+  FOC_STATE_SPEED,           /* speed loop -> current loop */
+  FOC_STATE_POSITION,        /* position loop -> speed -> current loop */
+  FOC_STATE_ERROR,           /* fault latched, outputs off */
+} foc_state_t;
+
+/* Calibration sub-phases (only meaningful in FOC_STATE_CALI). */
+typedef enum {
+  CALI_CURRENT_OFFSET = 0,   /* average phase-current ADC at zero current */
+  CALI_ALIGN_RAMP,           /* ramp Id at forced angle 0 */
+  CALI_ALIGN_SETTLE,         /* hold, let the rotor settle on phase A */
+  CALI_ALIGN_MEASURE,        /* read encoder -> store zero_offset, mech_at_align */
+  CALI_DIR_STEP,             /* shift to +90 deg elec, wait for rotor to follow */
+  CALI_DIR_READ,             /* compare mech_angle change -> determine direction */
+  CALI_DONE,
+} cali_phase_t;
+
+typedef struct {
+  cali_phase_t phase;
+  uint8_t with_align;        /* 0 = current offset only, 1 = also align encoder */
+  uint32_t counter;          /* per-phase sample/time counter */
+  uint32_t sum_u, sum_v, sum_w;
+  float id_ref;              /* ramped alignment current */
+  float mech_at_align;       /* mech_angle captured at theta_e=0 (before dir step) */
+} cali_ctx_t;
+
+/* Position controller with feed-forward and S-curve profiling */
+typedef struct {
+  float target_pos;
+  float current_pos;
+  float last_target_pos;
+
+  int32_t total_turns;
+  float last_theta;
+  uint8_t initialized;   /* 0 until first encoder reading — avoids spurious turn count */
+
+  float max_rpm;
+  float max_accel;
+  float max_jerk;
+  float last_output_rpm;
+} pos_controller_t;
+
+/* Domain sub-structs — group related data by responsibility */
+
+typedef struct {
+  encoder_data_t encoder;
+  phase_currents_t currents;
+  current_offset_t cur_offset;
+} motor_sensor_t;
+
+typedef struct {
+  clarke_t clarke;
+  park_t park;
+  inv_park_t inv_park;
+  svpwm_t svpwm;
+} motor_xform_t;
+
+typedef struct {
+  pid_t id;
+  pid_t iq;
+  pid_t speed;
+  pos_controller_t pos;
+  pll_t speed_pll;
+} motor_ctrl_t;
+
+typedef struct {
+  float vd;       /* voltage command (open/closed-loop voltage modes) */
+  float vq;
+  float id;
+  float iq;
+  float rpm;      /* also the open-loop speed command */
+  float pos;
+} motor_target_t;
+
+typedef struct {
+  float id;
+  float iq;
+  float rpm;
+  float pos;
+} motor_actual_t;
+
+typedef struct {
+  foc_state_t state;
+
+  motor_sensor_t sensor;
+  motor_xform_t xform;
+  motor_ctrl_t ctrl;
+  motor_target_t target;
+  motor_actual_t actual;
+
+  cali_ctx_t cali;
+  float openloop_angle;   /* electrical angle for FOC_STATE_OPENLOOP_VOLT */
+
+  float vdc;
+  uint32_t pwm_period;
+
+  uint8_t speed_loop_cnt;
+  uint8_t pos_loop_cnt;
+} motor_t;
+
+void foc_init(motor_t *motor);
+
+/* State machine */
+void foc_set_state(motor_t *motor, foc_state_t state);
+foc_state_t foc_get_state(const motor_t *motor);
+void foc_fault(motor_t *motor);                 /* force ERROR */
+void foc_clear_fault(motor_t *motor);           /* ERROR -> IDLE */
+
+/* Trigger an extra calibration. with_align != 0 also re-aligns the encoder
+ * zero (the motor will twitch to phase A). */
+void foc_start_calibration(motor_t *motor, uint8_t with_align);
+uint8_t foc_calibration_done(const motor_t *motor);
+
+/* Setpoints (take effect in the matching state) */
+void foc_set_voltage(motor_t *motor, float vd, float vq);
+void foc_set_openloop_speed(motor_t *motor, float rpm);
+void foc_set_target_current(motor_t *motor, float id, float iq);
+void foc_set_target_speed(motor_t *motor, float rpm);
+void foc_set_target_position(motor_t *motor, float pos_rad);
+
+/* Called every PWM period from the ADC inserted-conversion ISR. */
+void foc_control_loop(motor_t *motor);
+
+/* Called when the encoder DMA read completes (processes the raw angle). */
+void foc_encoder_callback(motor_t *motor);
+
+#endif /* FOC_CORE_H */

@@ -1,7 +1,5 @@
 # --- Keil uVision / MDK ---
 *.uvguix.*
-*.uvoptx
-*.uvprojx
 *.scvd
 *.dbgdt
 *.uvlprojx
