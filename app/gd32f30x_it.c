@@ -1,5 +1,6 @@
 #include "gd32f30x_it.h"
 #include "main.h"
+#include "drv8323.h"
 
 void NMI_Handler(void)          { Error_Handler(); }
 void HardFault_Handler(void)    { Error_Handler(); }
@@ -10,5 +11,8 @@ void SVC_Handler(void)          { Error_Handler(); }
 void DebugMon_Handler(void)     { Error_Handler(); }
 void PendSV_Handler(void)       { Error_Handler(); }
 void SysTick_Handler(void)      { }
+
+// DRV8323 nFAULT (PB2) falling edge — hardware emergency stop.
+void EXTI2_IRQHandler(void)     { drv8323_exti_isr(); }
 
 

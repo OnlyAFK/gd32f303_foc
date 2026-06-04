@@ -135,6 +135,15 @@ uint32_t uart_rx_available(void) {
   return lwrb_get_full(&rx_rb);
 }
 
+static const io_stream_t s_uart_stream = {
+  .write = uart_write,
+  .read = uart_read,
+};
+
+const io_stream_t *uart_stream(void) {
+  return &s_uart_stream;
+}
+
 // Start a DMA transfer of the next contiguous chunk in the TX ring buffer.
 // Safe to call from both thread and ISR context: PRIMASK is saved/restored so
 // the busy check and channel start cannot be interrupted by the TX-done ISR.

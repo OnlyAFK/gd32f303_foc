@@ -64,6 +64,24 @@ typedef enum {
   DRV8323_CSA_GAIN_40 = 3U,
 } drv8323_csa_gain_t;
 
+// Decoded fault state from the two status registers. The *_phase fields carry
+// the low 6 bits of the corresponding register (VDS_xx / VGS_xx, bit5..bit0 =
+// HA,LA,HB,LB,HC,LC) so the offending MOSFET can be pinpointed.
+typedef struct {
+  bool vds_ocp;     // any MOSFET VDS overcurrent
+  bool sen_ocp;     // any sense-resistor overcurrent
+  bool gdf;         // gate-drive fault
+  bool uvlo;        // VM undervoltage lockout
+  bool cpuv;        // charge-pump undervoltage
+  bool otsd;        // overtemperature shutdown
+  bool otw;         // overtemperature warning
+  uint8_t vds_phase;  // FS1 bits 5:0
+  uint8_t vgs_phase;  // FS2 bits 5:0
+  uint8_t sen_phase;  // FS2 bits 10:8 (SA/SB/SC_OC)
+  uint16_t fs1_raw;   // Fault Status 1 (0x00)
+  uint16_t fs2_raw;   // Fault Status 2 (0x01)
+} drv8323_faults_t;
+
 // Bring up the device: GPIO + SPI1, assert EN, then write the configuration
 // registers for 3x PWM mode. Returns true if the SPI read-back matches what
 // was written (i.e. communication with the DRV8323 is verified).
@@ -78,14 +96,39 @@ void drv8323_disable(void);
 uint16_t drv8323_read_reg(uint8_t addr);
 void drv8323_write_reg(uint8_t addr, uint16_t data);
 
+// (Re)write all configuration registers (PWM mode, gate drive, OCP, CSA). The
+// DRV resets its registers on a UVLO/sleep, so call this when recovering from a
+// fault before clearing it. Also used internally by drv8323_init().
+void drv8323_apply_config(void);
+
 // True while the nFAULT pin is asserted (low).
 bool drv8323_fault_active(void);
 
 uint16_t drv8323_get_fault_status1(void);
 uint16_t drv8323_get_vgs_status2(void);
 
+// Read both status registers over SPI and decode them into `f`.
+void drv8323_parse_faults(drv8323_faults_t *f);
+
 // Clear latched fault bits via the CLR_FLT bit (self-clearing).
 void drv8323_clear_fault(void);
+
+// --- nFAULT EXTI (hardware emergency stop) ---
+// Configure PB2/nFAULT as a falling-edge EXTI interrupt. Call AFTER the PWM
+// timer is initialised (the registered emergency callback disables the PWM).
+void drv8323_fault_exti_init(void);
+
+// Register the callback invoked from the nFAULT EXTI ISR. It runs in interrupt
+// context and must be short (e.g. disable the PWM outputs); it must NOT touch
+// the SPI bus. Pass NULL to detach.
+void drv8323_attach_emergency_cb(void (*cb)(void));
+
+// Returns (and clears) whether an nFAULT falling edge has occurred since the
+// last call. The slow monitor uses this to decide when to read the status regs.
+bool drv8323_nfault_edge_pending(void);
+
+// Called from EXTI2_IRQHandler (in app/gd32f30x_it.c).
+void drv8323_exti_isr(void);
 
 void drv8323_set_csa_gain(drv8323_csa_gain_t gain);
 

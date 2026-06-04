@@ -2,6 +2,7 @@
 #define MOTOR_HW_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "foc_math.h"
 #include "pwm_curr.h"
 
@@ -59,11 +60,46 @@ typedef struct {
   uint8_t is_calibrated;
 } current_offset_t;
 
+// Chip-neutral view of the gate-driver fault state. Decoded from whatever
+// driver this HAL is built on (currently DRV8323); the FOC/fault layers consume
+// this instead of the driver's own register layout so swapping the gate driver
+// does not ripple upward.
+typedef struct {
+  bool overcurrent;        // VDS or sense overcurrent
+  bool gate_fault;         // gate-drive fault (stuck gate / IDRIVE too low)
+  bool undervoltage;       // supply undervoltage lockout
+  bool charge_pump_uv;     // charge-pump undervoltage
+  bool overtemp_shutdown;  // thermal shutdown
+  bool overtemp_warning;   // thermal warning
+  uint16_t raw1;           // raw status register 1 (diagnostics)
+  uint16_t raw2;           // raw status register 2 (diagnostics)
+} motor_hw_driver_fault_t;
+
 void motor_hw_init(void);
 
 void motor_hw_enable_driver(void);
 
 void motor_hw_disable_driver(void);
+
+// Bus voltage (V) via the monitoring ADC. The single entry point so upper
+// layers do not reach into bsp directly.
+float motor_hw_get_vbus(void);
+
+// True while the gate driver is signalling a fault on its nFAULT line.
+bool motor_hw_driver_fault_pin(void);
+
+// Returns (and clears) whether an nFAULT edge has occurred since the last call.
+bool motor_hw_driver_fault_edge(void);
+
+// Decode the gate-driver status registers into the chip-neutral struct.
+void motor_hw_driver_get_faults(motor_hw_driver_fault_t *f);
+
+// Re-apply the driver configuration and clear its latched faults (used during
+// fault recovery; the driver resets its registers on a supply UVLO/sleep).
+void motor_hw_driver_reset(void);
+
+// Basic encoder health check (bus alive). False if the encoder link looks dead.
+bool motor_hw_encoder_ok(void);
 
 void motor_hw_set_pwm(uint32_t ccr_u, uint32_t ccr_v, uint32_t ccr_w);
 

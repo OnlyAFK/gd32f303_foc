@@ -37,6 +37,12 @@ extern float vofa_data[VOFA_CHANNEL_CNT];
 // Send `count` floats as a VOFA+ "justfloat" frame over the debug UART.
 void vofa_send_justfloat(float *data_ptr, uint8_t count);
 
+// Build a VOFA+ "justfloat" frame (count floats + tail) into `out`. Returns the
+// frame length in bytes, or 0 if `out_size` is too small. Transport-agnostic:
+// the caller writes the bytes to whatever io_stream it likes.
+uint32_t vofa_build_justfloat(const float *data, uint8_t count,
+                              uint8_t *out, uint32_t out_size);
+
 void vofa_update_from_motor(motor_t *motor);
 
 static inline void vofa_set_channel(uint8_t channel, float value) {

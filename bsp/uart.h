@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include "io_stream.h"
 
 // USART2 on PB10 (TX) / PB11 (RX), 3 Mbaud, DMA-driven with lwrb ring buffers.
 // TX: application data is queued in a ring buffer and drained by DMA0_CH1.
@@ -23,6 +24,10 @@ uint32_t uart_read(void *data, uint32_t len);
 
 // Number of bytes currently available to read.
 uint32_t uart_rx_available(void);
+
+// io_stream backend bound to this UART (write/read). Used by the CLI/telemetry
+// so they can be retargeted to another transport (e.g. USB CDC) later.
+const io_stream_t *uart_stream(void);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,6 @@
 #include "foc_core.h"
 #include <math.h>
-#include "drv8323.h"
+#include "fault.h"
 #include "vofa.h"
 
 /* Current loop defaults */
@@ -364,7 +364,15 @@ void foc_fault(motor_t *motor) {
 }
 
 void foc_clear_fault(motor_t *motor) {
-  if (motor->state == FOC_STATE_ERROR) {
+  if (motor->state != FOC_STATE_ERROR) {
+    return;
+  }
+  /* Only leave ERROR if every active protection condition has physically
+   * cleared (bus back in range, DRV nFAULT released, etc.). Latching faults
+   * (hard overcurrent, GDF, encoder, phase loss) re-arm and will trip again
+   * immediately if the underlying problem is still present. */
+  float vbus = motor_hw_get_vbus();
+  if (fault_try_clear(vbus)) {
     foc_set_state(motor, FOC_STATE_IDLE);
   }
 }
@@ -408,6 +416,30 @@ void foc_set_target_position(motor_t *motor, float pos_rad) {
   motor->ctrl.pos.target_pos = pos_rad;
 }
 
+void foc_set_pid_gains(motor_t *motor, foc_gain_sel_t sel, float kp, float ki) {
+  pid_t *p = (sel == FOC_GAIN_ID)   ? &motor->ctrl.id
+           : (sel == FOC_GAIN_IQ)   ? &motor->ctrl.iq
+                                    : &motor->ctrl.speed;
+  p->kp = kp;
+  p->ki = ki;
+}
+
+static void set_pid_limit(pid_t *p, float lim) {
+  p->out_max = lim;
+  p->out_min = -lim;
+  p->integral_max = lim;
+  p->integral_min = -lim;
+}
+
+void foc_set_limit(motor_t *motor, foc_limit_sel_t sel, float lim) {
+  if (sel == FOC_LIMIT_CURRENT) {
+    set_pid_limit(&motor->ctrl.id, lim);
+    set_pid_limit(&motor->ctrl.iq, lim);
+  } else {
+    set_pid_limit(&motor->ctrl.speed, lim);
+  }
+}
+
 void foc_encoder_callback(motor_t *motor) {
   motor_hw_process_encoder_data(&motor->sensor.encoder);
 }
@@ -415,20 +447,30 @@ void foc_encoder_callback(motor_t *motor) {
 void foc_control_loop(motor_t *motor) {
   motor_hw_debug_pin(1);
 
-  /* Trip on a hardware gate-driver fault while driving. */
-  if (drv8323_fault_active() &&
-      motor->state != FOC_STATE_IDLE && motor->state != FOC_STATE_ERROR) {
-    foc_fault(motor);
-  }
-
   /* Track the real bus voltage for correct SVPWM scaling. */
-  float vbus = read_vbus();
+  float vbus = motor_hw_get_vbus();
   if (vbus > 1.0f) {
     motor->vdc = vbus;
   }
 
   /* 1. Sample phase currents */
   motor_hw_get_currents(&motor->sensor.currents, &motor->sensor.cur_offset);
+
+  /* L2 fast protection: software overcurrent, bus overvoltage, DRV nFAULT pin.
+   * Trip into ERROR (outputs off) the moment any of them fires.
+   * Current-based checks require valid offsets: before the current-offset
+   * calibration completes, the readings are not real currents (the mid-scale
+   * ADC value would look like ~16 A and falsely trip the overcurrent guard). */
+  uint8_t driving =
+      (motor->state != FOC_STATE_IDLE && motor->state != FOC_STATE_ERROR &&
+       motor->sensor.cur_offset.is_calibrated);
+  if (fault_check_fast(motor->sensor.currents.iu, motor->sensor.currents.iv,
+                       motor->sensor.currents.iw, vbus, motor->actual.iq,
+                       driving != 0u)) {
+    if (driving) {
+      foc_fault(motor);
+    }
+  }
 
   /* 2. Start encoder read (async via DMA, processed in foc_encoder_callback) */
   motor_hw_start_encoder_read();

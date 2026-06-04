@@ -339,7 +339,7 @@
               <MiscControls></MiscControls>
               <Define>USE_STDPERIPH_DRIVER,GD32F30X_HD,__FPU_PRESENT,LWRB_DISABLE_ATOMIC,ARM_MATH_CM4,</Define>
               <Undefine></Undefine>
-              <IncludePath>..\libraries\CMSIS;..\libraries\CMSIS\GD\GD32F30x\Include;..\libraries\GD32F30x_standard_peripheral\Include;..\libraries\lwrb;..;..\app;..\bsp;..\driver\drv8323;..\driver\tle5012b;..\foc;..\util;..\libraries\CMSIS-DSP</IncludePath>
+              <IncludePath>..\libraries\CMSIS;..\libraries\CMSIS\GD\GD32F30x\Include;..\libraries\GD32F30x_standard_peripheral\Include;..\libraries\lwrb;..;..\app;..\bsp;..\driver\drv8323;..\driver\tle5012b;..\foc;..\util;..\libraries\CMSIS-DSP;..\libraries\letter-shell</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -538,6 +538,11 @@
               <FileType>1</FileType>
               <FilePath>..\app\gd32f30x_it.c</FilePath>
             </File>
+            <File>
+              <FileName>shell_port.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\shell_port.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -582,6 +587,11 @@
               <FileName>foc_core.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\foc\foc_core.c</FilePath>
+            </File>
+            <File>
+              <FileName>fault.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\foc\fault.c</FilePath>
             </File>
             <File>
               <FileName>foc_math.c</FileName>
@@ -635,6 +645,16 @@
               <FileName>lwrb_ex.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\libraries\lwrb\lwrb_ex.c</FilePath>
+            </File>
+            <File>
+              <FileName>shell.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\libraries\letter-shell\shell.c</FilePath>
+            </File>
+            <File>
+              <FileName>shell_ext.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\libraries\letter-shell\shell_ext.c</FilePath>
             </File>
           </Files>
         </Group>

@@ -2,18 +2,33 @@
 #include "drv8323.h"
 #include "tle5012b.h"
 #include "pwm_curr.h"
+#include "fault.h"
 #include <math.h>
 
 #define CALIBRATION_SAMPLES 1000u
 #define RAW_TO_RAD          (FOC_2PI / (float)HW_ENCODER_CPR)
 
+// Hardware emergency stop, invoked from the DRV8323 nFAULT EXTI ISR. Must be
+// short and must not touch SPI: just kill the gate-drive PWM outputs.
+static void motor_hw_emergency_stop(void) {
+  pwm_disable();
+}
+
 void motor_hw_init(void) {
   // Bring up the whole power/feedback stage. drv8323_init enables the gate
   // driver and sets 3x PWM mode; pwm_curr_init starts TIMER0 + the ADC trigger
   // (PWM channel outputs stay disabled until motor_hw_enable_driver).
-  drv8323_init();
+  // SPI read-back verifies the link to the DRV8323; a mismatch latches a comm
+  // fault (fault_init() has already run by this point).
+  if (!drv8323_init()) {
+    fault_raise(FAULT_DRV_COMM, 0.0f, 0.0f);
+  }
   tle5012b_init();
   pwm_curr_init();
+
+  // Now that the PWM timer exists, arm the nFAULT hardware emergency stop.
+  drv8323_attach_emergency_cb(motor_hw_emergency_stop);
+  drv8323_fault_exti_init();
 }
 
 void motor_hw_enable_driver(void) {
@@ -22,6 +37,43 @@ void motor_hw_enable_driver(void) {
 
 void motor_hw_disable_driver(void) {
   pwm_disable();
+}
+
+float motor_hw_get_vbus(void) {
+  return read_vbus();
+}
+
+bool motor_hw_driver_fault_pin(void) {
+  return drv8323_fault_active();
+}
+
+bool motor_hw_driver_fault_edge(void) {
+  return drv8323_nfault_edge_pending();
+}
+
+void motor_hw_driver_get_faults(motor_hw_driver_fault_t *f) {
+  drv8323_faults_t d;
+  drv8323_parse_faults(&d);
+  f->overcurrent       = d.vds_ocp || d.sen_ocp;
+  f->gate_fault        = d.gdf;
+  f->undervoltage      = d.uvlo;
+  f->charge_pump_uv    = d.cpuv;
+  f->overtemp_shutdown = d.otsd;
+  f->overtemp_warning  = d.otw;
+  f->raw1 = d.fs1_raw;
+  f->raw2 = d.fs2_raw;
+}
+
+void motor_hw_driver_reset(void) {
+  drv8323_apply_config();
+  drv8323_clear_fault();
+}
+
+bool motor_hw_encoder_ok(void) {
+  // A healthy SSC bus echoes ~0x8020 on the command word; all-ones / all-zeros
+  // means SCK/MOSI/MISO are not reaching the sensor.
+  uint16_t echo = tle5012b_debug_cmd_echo();
+  return (echo != 0x0000u) && (echo != 0xFFFFu);
 }
 
 // Phase mapping for this board (verified on the dgm reference):

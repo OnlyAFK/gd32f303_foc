@@ -134,6 +134,17 @@ void foc_set_target_current(motor_t *motor, float id, float iq);
 void foc_set_target_speed(motor_t *motor, float rpm);
 void foc_set_target_position(motor_t *motor, float pos_rad);
 
+/* Live tuning (used by the shell). Selectors for the gain/limit setters. */
+typedef enum { FOC_GAIN_ID = 0, FOC_GAIN_IQ, FOC_GAIN_SPEED } foc_gain_sel_t;
+typedef enum { FOC_LIMIT_CURRENT = 0, FOC_LIMIT_SPEED } foc_limit_sel_t;
+
+/* Update PID gains of a loop without resetting its state. */
+void foc_set_pid_gains(motor_t *motor, foc_gain_sel_t sel, float kp, float ki);
+
+/* Update the output + integral clamp of the current loops (both id/iq) or the
+ * speed loop. `lim` is applied symmetrically (+/-lim). */
+void foc_set_limit(motor_t *motor, foc_limit_sel_t sel, float lim);
+
 /* Called every PWM period from the ADC inserted-conversion ISR. */
 void foc_control_loop(motor_t *motor);
 

@@ -1,8 +1,9 @@
 #include "vofa.h"
+#include <string.h>
 #include "uart.h"
 
 // VOFA+ "justfloat" frame: N little-endian floats followed by the tail bytes
-// 00 00 80 7F. Transport is the debug UART (uart.c, DMA-backed ring buffer).
+// 00 00 80 7F. The MCU is little-endian, so the floats are copied verbatim.
 static const uint8_t vofa_tail[4] = {0x00, 0x00, 0x80, 0x7F};
 
 float vofa_data[VOFA_CHANNEL_CNT] = {0};
@@ -10,6 +11,18 @@ float vofa_data[VOFA_CHANNEL_CNT] = {0};
 void vofa_send_justfloat(float *data_ptr, uint8_t count) {
   uart_write((uint8_t *)data_ptr, (uint32_t)count * sizeof(float));
   uart_write(vofa_tail, sizeof(vofa_tail));
+}
+
+uint32_t vofa_build_justfloat(const float *data, uint8_t count,
+                              uint8_t *out, uint32_t out_size) {
+  uint32_t payload = (uint32_t)count * sizeof(float);
+  uint32_t total = payload + sizeof(vofa_tail);
+  if (out == 0 || out_size < total) {
+    return 0;
+  }
+  memcpy(out, data, payload);
+  memcpy(out + payload, vofa_tail, sizeof(vofa_tail));
+  return total;
 }
 
 void vofa_update_from_motor(motor_t *motor) {
