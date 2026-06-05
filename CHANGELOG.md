@@ -19,6 +19,58 @@ Entry template:
 
 ---
 
+## Flash parameter management (FlashDB) — 2026-06-05
+### What
+- **FlashDB 2.2.0 (KVDB-only)** vendored at `libraries/flashdb` (inc/src + FAL;
+  demos/tests removed). On-chip flash port `bsp/flash_port.c` backs the top 8 KB
+  of flash (`0x0803_E000`, 4×2 KB sectors) as the KVDB partition; Keil IROM1 was
+  shrunk `0x40000 → 0x3E000` so code never overlaps it. No heap (static partition
+  table), no TSDB; FlashDB/FAL logs are routed to the UART (`fdb_uart_printf`)
+  instead of the unretargeted `printf` (which would hit semihosting and hang).
+- **`app/params.{c,h}`** — table-driven KV parameter store. Single runtime source
+  of truth `params_t`; `foc_init()` defaults are captured as the factory
+  fallback, then flash values override them and are applied through the existing
+  foc setters + `fault_set_cfg`. Saves write only **changed** keys (an `s_saved`
+  snapshot) to bound sector GC. Stored params are tagged with the firmware
+  version (`app/version.h`, starts `0.1.0`); on boot a MAJOR.MINOR mismatch
+  discards the stored layout (PATCH ignored). Encoder calibration (zero offset +
+  direction) is persisted, so boot skips the rotor-twitching alignment once
+  `cali_valid` is set. All flash writes are gated to `IDLE`.
+- **Runtime-tunable protection thresholds** — the operational thresholds moved
+  from `#define` into `fault_cfg_t` (`fault_set_cfg`/`fault_get_cfg`). VESC-style
+  guard: `thr_protect_en` clamps values to the `*_HARD_MIN/MAX` silicon limits.
+- **Persistent fault log** — a ring of 4 `fault_status_t` snapshots in a KV blob,
+  pushed on the fault-latch edge (outputs already off), survives power-off.
+- **Shell**: `get`/`set`/`save`/`load`/`factory`/`thrprot`/`faultlog`; `pid`/`lim`
+  now persist through `params_set`.
+### Why
+- Keep shell-tuned gains, protection thresholds and auto-calibration across power
+  cycles; tune in the field without reflashing; read the last faults after a
+  power-cycle. A normal Keil download does not erase the KVDB region, so params
+  survive firmware updates (only a full chip-erase or a MAJOR.MINOR version bump
+  resets them).
+### How to use
+- `get [name]` lists/shows params; `set <name> <value>` applies live + auto-saves
+  in IDLE (clamped to safe limits while `thr_en=1`). `save`/`load`/`factory` need
+  IDLE. `thrprot <0|1>` toggles the threshold guard. `faultlog` dumps the stored
+  fault history. Param keys: `id_kp iq_kp cur_lim spd_kp spd_lim pos_* thr_*` etc.
+- Calibration auto-saves; the first boot (or after `factory`) re-aligns once then
+  persists, so later boots no longer twitch.
+- Keep Keil's flash setting on **Erase Sectors** (not Full Chip) so downloads
+  preserve params.
+### Notes / follow-ups
+- FlashDB's `set_kv` never skips an unchanged value; writing all keys every save
+  bloated the log and forced GC — a reset during a GC erase once made FlashDB
+  self-reformat ("All sector header is incorrect", wiping params). Mitigated by
+  the changed-keys-only save.
+- Firmware version `0.1.0` (`app/version.h`) is the new product version (the
+  banner's `3.1.2` is letter-shell's). Bump MINOR when an existing stored
+  parameter's type/size/meaning changes (resets stored params); PATCH for
+  everything else (params kept). Shown in the shell banner + `status`.
+- `pole_pairs` is still compile-time (`HW_MOTOR_POLE_PAIRS`); current-sense
+  offsets are re-measured every boot (not stored).
+- `app/shell_port.c` is now 534 lines — a split candidate as more commands land.
+
 ## Protection/fault system, letter-shell console, HAL decouple — 2026-06-04
 ### What
 - **Protection / fault** (`foc/fault.{c,h}`, new): bitmask fault codes with

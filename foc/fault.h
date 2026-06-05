@@ -106,6 +106,56 @@ typedef enum {
  * than this or the MCU resets (and PWM stops). */
 #define FAULT_WDG_TIMEOUT_MS  200u
 
+/* ===================================================================
+ * Runtime-tunable thresholds.
+ *
+ * The subset of thresholds above that an operator may retune at runtime live in
+ * `fault_cfg_t` (stored in flash via app/params). The #define values above are
+ * their compile-time DEFAULTS; the remaining #defines (timing / debounce /
+ * phase-loss / warn levels) stay compile-time only.
+ *
+ * VESC-style guard: while `thr_protect_en` is set, any value handed to
+ * fault_set_cfg() is clamped to the *_HARD_MIN/MAX bounds below — these encode
+ * the real silicon limits (ADC saturation, DRV UVLO, MOSFET rating) and are
+ * never user-settable. Clearing the flag lets an expert set raw values.
+ * =================================================================== */
+#define FAULT_OC_SW_HARD_MAX      16.0f    /* current sense saturates at ~+/-16.5 A */
+#define FAULT_OC_SW_HARD_MIN      1.0f
+#define FAULT_VBUS_OV_HARD_MAX    32.0f    /* above this the stage is at risk */
+#define FAULT_VBUS_OV_HARD_MIN    24.0f    /* OV trip must stay above the nominal bus */
+#define FAULT_VBUS_UV_HARD_MAX    22.0f    /* UV trip must stay below the nominal bus */
+#define FAULT_VBUS_UV_HARD_MIN    6.0f     /* DRV UVLO ~5.6 V */
+#define FAULT_I_CONT_HARD_MAX     10.0f
+#define FAULT_I_CONT_HARD_MIN     0.5f
+#define FAULT_I2T_HARD_MAX        2000.0f
+#define FAULT_I2T_HARD_MIN        1.0f
+#define FAULT_STALL_IQ_HARD_MAX   14.0f    /* <= software OC peak */
+#define FAULT_STALL_IQ_HARD_MIN   1.0f
+#define FAULT_STALL_RPM_HARD_MAX  200.0f
+#define FAULT_STALL_RPM_HARD_MIN  5.0f
+#define FAULT_OVERSPEED_HARD_MAX  5000.0f
+#define FAULT_OVERSPEED_HARD_MIN  100.0f
+
+typedef struct {
+  uint8_t thr_protect_en;   /* 1: clamp the values below to *_HARD_MIN/MAX */
+  float vbus_ov_trip;       /* bus overvoltage trip (V) */
+  float vbus_uv_trip;       /* bus undervoltage trip (V) */
+  float oc_sw_peak;         /* software per-phase overcurrent peak (A) */
+  float i_cont;             /* I^2 t continuous current (A) */
+  float i2t_budget;         /* I^2 t budget (A^2 * s) */
+  float stall_iq;           /* stall torque-current threshold (A) */
+  float stall_rpm;          /* |rpm| below this counts as stopped */
+  float overspeed_rpm;      /* mechanical overspeed trip (RPM) */
+} fault_cfg_t;
+
+// Replace the live protection thresholds. With thr_protect_en set, values are
+// clamped to the *_HARD_MIN/MAX bounds before taking effect. IRQ-safe (the fast
+// check reads the config from the control ISR).
+void fault_set_cfg(const fault_cfg_t *cfg);
+
+// The live (already-clamped) threshold configuration.
+const fault_cfg_t *fault_get_cfg(void);
+
 typedef struct {
   uint32_t active;          /* faults asserted right now */
   uint32_t latched;         /* every fault seen since the last clear */

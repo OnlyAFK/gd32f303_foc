@@ -18,7 +18,7 @@
           <Vendor>GigaDevice</Vendor>
           <PackID>GigaDevice.GD32F30x_DFP.2.2.1</PackID>
           <PackURL>https://gd32mcu.com/data/documents/pack/</PackURL>
-          <Cpu>IRAM(0x20000000,0x0C000) IROM(0x08000000,0x040000) CPUTYPE("Cortex-M4") FPU2 CLOCK(12000000) ELITTLE</Cpu>
+          <Cpu>IRAM(0x20000000,0x0C000) IROM(0x08000000,0x03E000) CPUTYPE("Cortex-M4") FPU2 CLOCK(12000000) ELITTLE</Cpu>
           <FlashUtilSpec></FlashUtilSpec>
           <StartupFile></StartupFile>
           <FlashDriverDll>UL2CM3(-S0 -C0 -P0 -FD20000000 -FC1000 -FN1 -FF0GD32F30x_HD -FS08000000 -FL040000 -FP0($$Device:GD32F303CC$Flash\GD32F30x_HD.FLM))</FlashDriverDll>
@@ -251,7 +251,7 @@
               <IROM>
                 <Type>1</Type>
                 <StartAddress>0x8000000</StartAddress>
-                <Size>0x40000</Size>
+                <Size>0x3e000</Size>
               </IROM>
               <XRAM>
                 <Type>0</Type>
@@ -276,7 +276,7 @@
               <OCR_RVCT4>
                 <Type>1</Type>
                 <StartAddress>0x8000000</StartAddress>
-                <Size>0x40000</Size>
+                <Size>0x3e000</Size>
               </OCR_RVCT4>
               <OCR_RVCT5>
                 <Type>1</Type>
@@ -339,7 +339,7 @@
               <MiscControls></MiscControls>
               <Define>USE_STDPERIPH_DRIVER,GD32F30X_HD,__FPU_PRESENT,LWRB_DISABLE_ATOMIC,ARM_MATH_CM4,</Define>
               <Undefine></Undefine>
-              <IncludePath>..\libraries\CMSIS;..\libraries\CMSIS\GD\GD32F30x\Include;..\libraries\GD32F30x_standard_peripheral\Include;..\libraries\lwrb;..;..\app;..\bsp;..\driver\drv8323;..\driver\tle5012b;..\foc;..\util;..\libraries\CMSIS-DSP;..\libraries\letter-shell</IncludePath>
+              <IncludePath>..\libraries\CMSIS;..\libraries\CMSIS\GD\GD32F30x\Include;..\libraries\GD32F30x_standard_peripheral\Include;..\libraries\lwrb;..;..\app;..\bsp;..\driver\drv8323;..\driver\tle5012b;..\foc;..\util;..\libraries\CMSIS-DSP;..\libraries\letter-shell;..\libraries\flashdb\inc;..\libraries\flashdb\port\fal\inc</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -543,6 +543,16 @@
               <FileType>1</FileType>
               <FilePath>..\app\shell_port.c</FilePath>
             </File>
+            <File>
+              <FileName>params.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\params.c</FilePath>
+            </File>
+            <File>
+              <FileName>version.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\app\version.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -665,6 +675,46 @@
               <FileName>arm_cortexM4lf_math.lib</FileName>
               <FileType>4</FileType>
               <FilePath>..\libraries\CMSIS-DSP\arm_cortexM4lf_math.lib</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>FlashDB</GroupName>
+          <Files>
+            <File>
+              <FileName>flash_port.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\bsp\flash_port.c</FilePath>
+            </File>
+            <File>
+              <FileName>fal.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\libraries\flashdb\port\fal\src\fal.c</FilePath>
+            </File>
+            <File>
+              <FileName>fal_flash.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\libraries\flashdb\port\fal\src\fal_flash.c</FilePath>
+            </File>
+            <File>
+              <FileName>fal_partition.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\libraries\flashdb\port\fal\src\fal_partition.c</FilePath>
+            </File>
+            <File>
+              <FileName>fdb.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\libraries\flashdb\src\fdb.c</FilePath>
+            </File>
+            <File>
+              <FileName>fdb_kvdb.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\libraries\flashdb\src\fdb_kvdb.c</FilePath>
+            </File>
+            <File>
+              <FileName>fdb_utils.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\libraries\flashdb\src\fdb_utils.c</FilePath>
             </File>
           </Files>
         </Group>

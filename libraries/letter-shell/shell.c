@@ -14,6 +14,7 @@
 #include "stdarg.h"
 #include "shell_ext.h"
 
+#include "version.h"
 
 #if SHELL_USING_CMD_EXPORT == 1
 /**
@@ -93,8 +94,8 @@ static const char *shellText[] =
         "|_____\\___|\\__|\\__\\___|_|    |___/_| |_|\\___|_|_|\r\n"
         "\r\n"
         "Build:       "__DATE__" "__TIME__"\r\n"
-        "Version:     "SHELL_VERSION"\r\n"
-        "Copyright:   (c) 2020 Letter\r\n",
+        "FOC firmware "FW_VER_STRING"\r\n",
+//        "Copyright:   (c) 2020 Letter\r\n",
 #endif
     [SHELL_TEXT_CMD_TOO_LONG] = 
         "\r\nWarning: Command is too long\r\n",

@@ -6,6 +6,8 @@
 
 #include "shell.h"
 #include "fault.h"
+#include "params.h"
+#include "version.h"
 #include "vofa.h"
 #include "motor_hw.h"
 #include "foc_math.h"
@@ -216,6 +218,7 @@ static int cmd_status(int argc, char *argv[]) {
   (void)argc; (void)argv;
   const fault_status_t *f = fault_get();
 
+  shellPrint(&s_shell, "fw = %s\r\n", FW_VER_STRING);
   shellPrint(&s_shell, "mode = %s\r\n", state_name(foc_get_state(s_motor)));
   print_f("vbus_V", motor_hw_get_vbus());
 
@@ -257,24 +260,27 @@ static int cmd_dump(int argc, char *argv[]) {
   return 0;
 }
 
+// pid/lim route through params_set so a tuned gain applies live AND persists
+// (auto-saved on the next return to IDLE), same path as the generic `set`.
 static int cmd_pid(int argc, char *argv[]) {
   if (argc < 4) {
     shellWriteString(&s_shell, "usage: pid <id|iq|spd> <kp> <ki>\r\n");
     return 0;
   }
-  foc_gain_sel_t sel;
+  const char *kp_key, *ki_key;
   if (strcmp(argv[1], "id") == 0) {
-    sel = FOC_GAIN_ID;
+    kp_key = "id_kp"; ki_key = "id_ki";
   } else if (strcmp(argv[1], "iq") == 0) {
-    sel = FOC_GAIN_IQ;
+    kp_key = "iq_kp"; ki_key = "iq_ki";
   } else if (strcmp(argv[1], "spd") == 0) {
-    sel = FOC_GAIN_SPEED;
+    kp_key = "spd_kp"; ki_key = "spd_ki";
   } else {
     shellWriteString(&s_shell, "loop must be id|iq|spd\r\n");
     return 0;
   }
-  foc_set_pid_gains(s_motor, sel, arg_f(argv[2]), arg_f(argv[3]));
-  shellWriteString(&s_shell, "pid updated\r\n");
+  params_set(s_motor, kp_key, arg_f(argv[2]));
+  params_set(s_motor, ki_key, arg_f(argv[3]));
+  shellWriteString(&s_shell, "pid updated (auto-saves in IDLE)\r\n");
   return 0;
 }
 
@@ -283,15 +289,17 @@ static int cmd_lim(int argc, char *argv[]) {
     shellWriteString(&s_shell, "usage: lim <cur|spd> <value>\r\n");
     return 0;
   }
+  const char *key;
   if (strcmp(argv[1], "cur") == 0) {
-    foc_set_limit(s_motor, FOC_LIMIT_CURRENT, arg_f(argv[2]));
+    key = "cur_lim";
   } else if (strcmp(argv[1], "spd") == 0) {
-    foc_set_limit(s_motor, FOC_LIMIT_SPEED, arg_f(argv[2]));
+    key = "spd_lim";
   } else {
     shellWriteString(&s_shell, "target must be cur|spd\r\n");
     return 0;
   }
-  shellWriteString(&s_shell, "limit updated\r\n");
+  params_set(s_motor, key, arg_f(argv[2]));
+  shellWriteString(&s_shell, "limit updated (auto-saves in IDLE)\r\n");
   return 0;
 }
 
@@ -323,6 +331,107 @@ static int cmd_reboot(int argc, char *argv[]) {
   shellWriteString(&s_shell, "rebooting...\r\n");
   NVIC_SystemReset();
   return 0;  // not reached
+}
+
+// --- Parameter (flash) commands ---
+
+static int cmd_get(int argc, char *argv[]) {
+  if (argc >= 2) {
+    float v;
+    if (params_get_value(argv[1], &v)) {
+      print_f(argv[1], v);
+    } else {
+      shellWriteString(&s_shell, "unknown param\r\n");
+    }
+    return 0;
+  }
+  // no arg: list every parameter + value
+  for (uint32_t i = 0u; i < params_field_count(); i++) {
+    print_f(params_field_name(i), params_field_value(i));
+  }
+  return 0;
+}
+
+static int cmd_set(int argc, char *argv[]) {
+  if (argc < 3) {
+    shellWriteString(&s_shell, "usage: set <name> <value>  (run 'get' for names)\r\n");
+    return 0;
+  }
+  if (!params_set(s_motor, argv[1], arg_f(argv[2]))) {
+    shellWriteString(&s_shell, "unknown param\r\n");
+    return 0;
+  }
+  // echo the effective (possibly clamped) value
+  float v;
+  params_get_value(argv[1], &v);
+  print_f(argv[1], v);
+  shellWriteString(&s_shell, "applied; auto-saves in IDLE (or use 'save')\r\n");
+  return 0;
+}
+
+static int cmd_save(int argc, char *argv[]) {
+  (void)argc; (void)argv;
+  if (foc_get_state(s_motor) == FOC_STATE_IDLE) {
+    params_save();
+    shellWriteString(&s_shell, "saved to flash\r\n");
+  } else {
+    params_mark_dirty();
+    shellWriteString(&s_shell, "not IDLE: queued, will save on return to IDLE\r\n");
+  }
+  return 0;
+}
+
+static int cmd_load(int argc, char *argv[]) {
+  (void)argc; (void)argv;
+  params_reload(s_motor);
+  shellWriteString(&s_shell, "reloaded from flash (unsaved changes discarded)\r\n");
+  return 0;
+}
+
+static int cmd_factory(int argc, char *argv[]) {
+  (void)argc; (void)argv;
+  if (foc_get_state(s_motor) != FOC_STATE_IDLE) {
+    shellWriteString(&s_shell, "need IDLE first (use 'stop')\r\n");
+    return 0;
+  }
+  params_factory_reset(s_motor);
+  shellWriteString(&s_shell, "factory defaults restored + saved (re-align needed)\r\n");
+  return 0;
+}
+
+static int cmd_thrprot(int argc, char *argv[]) {
+  if (argc >= 2) {
+    params_set(s_motor, "thr_en", arg_f(argv[1]));
+  }
+  float v = 0.0f;
+  params_get_value("thr_en", &v);
+  shellPrint(&s_shell, "thr_protect = %d (1=clamp to safe limits, 0=raw expert)\r\n",
+             (int)v);
+  return 0;
+}
+
+static int cmd_faultlog(int argc, char *argv[]) {
+  (void)argc; (void)argv;
+  uint32_t depth = params_fault_log_depth();
+  if (depth == 0u) {
+    shellWriteString(&s_shell, "fault log empty\r\n");
+    return 0;
+  }
+  // newest first; survives power-off (stored in flash)
+  for (uint32_t i = 0u; i < depth; i++) {
+    const fault_status_t *e = params_fault_log_entry(i);
+    shellPrint(&s_shell, "[%u] first=0x%05x latched=0x%05x tick=%ums\r\n",
+               (unsigned)i, (unsigned)e->first, (unsigned)e->latched,
+               (unsigned)e->tick_at_fault);
+    shellWriteString(&s_shell, "    cause:");
+    print_fault_names(e->first);
+    shellWriteString(&s_shell, "\r\n");
+    print_f("    vbus_V", e->vbus_at_fault);
+    print_f("    iq_A", e->iq_at_fault);
+    shellPrint(&s_shell, "    DRV FS1=0x%03x FS2=0x%03x\r\n",
+               (unsigned)e->drv_fs1, (unsigned)e->drv_fs2);
+  }
+  return 0;
 }
 
 // --- Command table (SHELL_USING_CMD_EXPORT == 0: shell.c reads this directly).
@@ -379,6 +488,13 @@ const ShellCommand shellCommandList[] = {
   SHELL_CMD_ITEM(CMD_ATTR, lim, cmd_lim, set limit: lim <cur|spd> <value>),
   SHELL_CMD_ITEM(CMD_ATTR, clrfault, cmd_clrfault, clear active fault (ERROR -> IDLE)),
   SHELL_CMD_ITEM(CMD_ATTR, clrlatch, cmd_clrlatch, clear latched fault history),
+  SHELL_CMD_ITEM(CMD_ATTR, get, cmd_get, list/show stored params: get [name]),
+  SHELL_CMD_ITEM(CMD_ATTR, set, cmd_set, set stored param: set <name> <value>),
+  SHELL_CMD_ITEM(CMD_ATTR, save, cmd_save, write params to flash (IDLE)),
+  SHELL_CMD_ITEM(CMD_ATTR, load, cmd_load, reload params from flash (discard unsaved)),
+  SHELL_CMD_ITEM(CMD_ATTR, factory, cmd_factory, restore factory defaults (IDLE)),
+  SHELL_CMD_ITEM(CMD_ATTR, thrprot, cmd_thrprot, threshold guard: thrprot <0|1>),
+  SHELL_CMD_ITEM(CMD_ATTR, faultlog, cmd_faultlog, show stored fault history (survives power-off)),
   SHELL_CMD_ITEM(CMD_ATTR, scope, cmd_scope, stream VOFA waveform (press key to stop)),
   SHELL_CMD_ITEM(CMD_ATTR, reboot, cmd_reboot, software reset),
 };

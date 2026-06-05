@@ -11,9 +11,18 @@
 
 static fault_status_t s_status;
 
+// Live, runtime-tunable thresholds (defaults set in fault_init, overridden from
+// flash via app/params -> fault_set_cfg). Read from the control ISR, so updates
+// are made under a brief IRQ mask.
+static fault_cfg_t s_cfg;
+
 // Free-running millisecond timestamp, updated by fault_monitor_slow(). Also
 // used by fault_raise() (which may run in ISR context) for the trip timestamp.
 static volatile uint32_t s_tick_ms;
+
+static inline float clampf(float v, float lo, float hi) {
+  return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
 
 // Detector state (owned by the slow monitor / main context).
 static uint32_t s_uv_since;        // tick when bus first went under-voltage (0 = ok)
@@ -70,6 +79,18 @@ void fault_init(void) {
   s_i2t_last_tick = 0u;
   s_i2t_accum = 0.0f;
 
+  // Seed the runtime thresholds with the compile-time defaults so protection is
+  // valid before app/params loads any stored overrides.
+  s_cfg.thr_protect_en = 1u;
+  s_cfg.vbus_ov_trip   = FAULT_VBUS_OV_TRIP;
+  s_cfg.vbus_uv_trip   = FAULT_VBUS_UV_TRIP;
+  s_cfg.oc_sw_peak     = FAULT_OC_SW_PEAK;
+  s_cfg.i_cont         = FAULT_I_CONT;
+  s_cfg.i2t_budget     = FAULT_I2T_BUDGET;
+  s_cfg.stall_iq       = FAULT_STALL_IQ;
+  s_cfg.stall_rpm      = FAULT_STALL_RPM;
+  s_cfg.overspeed_rpm  = FAULT_OVERSPEED_RPM;
+
   // If the previous reset came from the independent watchdog, record it so the
   // operator knows the control loop hung.
   if (rcu_flag_get(RCU_FLAG_FWDGTRST) != RESET) {
@@ -84,6 +105,32 @@ void fault_watchdog_start(void) {
   // reload = timeout_ms * 1250 / 1000.
   fwdgt_config((uint16_t)((FAULT_WDG_TIMEOUT_MS * 1250u) / 1000u), FWDGT_PSC_DIV32);
   fwdgt_enable();
+}
+
+void fault_set_cfg(const fault_cfg_t *cfg) {
+  fault_cfg_t c = *cfg;
+
+  // VESC-style guard: clamp to the silicon-limit bounds unless protection is
+  // explicitly disabled.
+  if (c.thr_protect_en) {
+    c.oc_sw_peak    = clampf(c.oc_sw_peak,    FAULT_OC_SW_HARD_MIN,     FAULT_OC_SW_HARD_MAX);
+    c.vbus_ov_trip  = clampf(c.vbus_ov_trip,  FAULT_VBUS_OV_HARD_MIN,   FAULT_VBUS_OV_HARD_MAX);
+    c.vbus_uv_trip  = clampf(c.vbus_uv_trip,  FAULT_VBUS_UV_HARD_MIN,   FAULT_VBUS_UV_HARD_MAX);
+    c.i_cont        = clampf(c.i_cont,        FAULT_I_CONT_HARD_MIN,    FAULT_I_CONT_HARD_MAX);
+    c.i2t_budget    = clampf(c.i2t_budget,    FAULT_I2T_HARD_MIN,       FAULT_I2T_HARD_MAX);
+    c.stall_iq      = clampf(c.stall_iq,      FAULT_STALL_IQ_HARD_MIN,  FAULT_STALL_IQ_HARD_MAX);
+    c.stall_rpm     = clampf(c.stall_rpm,     FAULT_STALL_RPM_HARD_MIN, FAULT_STALL_RPM_HARD_MAX);
+    c.overspeed_rpm = clampf(c.overspeed_rpm, FAULT_OVERSPEED_HARD_MIN, FAULT_OVERSPEED_HARD_MAX);
+  }
+
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  s_cfg = c;
+  __set_PRIMASK(primask);
+}
+
+const fault_cfg_t *fault_get_cfg(void) {
+  return &s_cfg;
 }
 
 void fault_raise(uint32_t code, float vbus, float iq) {
@@ -122,9 +169,9 @@ bool fault_check_fast(float iu, float iv, float iw, float vbus, float iq,
   // Software instantaneous overcurrent (per phase). Only meaningful while the
   // outputs are live.
   if (driving) {
-    if (fabsf(iu) > FAULT_OC_SW_PEAK ||
-        fabsf(iv) > FAULT_OC_SW_PEAK ||
-        fabsf(iw) > FAULT_OC_SW_PEAK) {
+    if (fabsf(iu) > s_cfg.oc_sw_peak ||
+        fabsf(iv) > s_cfg.oc_sw_peak ||
+        fabsf(iw) > s_cfg.oc_sw_peak) {
       fault_raise(FAULT_OVERCURRENT_SW, vbus, iq);
       trip = true;
     }
@@ -132,7 +179,7 @@ bool fault_check_fast(float iu, float iv, float iw, float vbus, float iq,
 
   // Bus overvoltage must react immediately (regenerative kickback can ramp the
   // rail in well under a millisecond). Checked regardless of drive state.
-  if (vbus > FAULT_VBUS_OV_TRIP) {
+  if (vbus > s_cfg.vbus_ov_trip) {
     fault_raise(FAULT_BUS_OV, vbus, iq);
     trip = true;
   }
@@ -157,7 +204,7 @@ void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
   }
 
   // --- Bus overvoltage (debounced; the fast path already trips hard) ---
-  if (vbus > FAULT_VBUS_OV_TRIP) {
+  if (vbus > s_cfg.vbus_ov_trip) {
     if (s_ov_since == 0u) s_ov_since = tick_ms ? tick_ms : 1u;
     if ((tick_ms - s_ov_since) >= FAULT_OV_DEBOUNCE_MS) {
       fault_raise(FAULT_BUS_OV, vbus, iq);
@@ -167,7 +214,7 @@ void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
   }
 
   // --- Bus undervoltage (debounced so stall/inrush sag is ignored) ---
-  if (vbus < FAULT_VBUS_UV_TRIP) {
+  if (vbus < s_cfg.vbus_uv_trip) {
     if (s_uv_since == 0u) s_uv_since = tick_ms ? tick_ms : 1u;
     if ((tick_ms - s_uv_since) >= FAULT_UV_DEBOUNCE_MS) {
       fault_raise(FAULT_BUS_UV, vbus, iq);
@@ -182,21 +229,21 @@ void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
   if (dt > 0.0f && dt < 0.1f) {  // ignore the first call / long gaps
     float iw = -iu - iv;
     float i2 = fmax3(iu * iu, iv * iv, iw * iw);  // worst-phase current^2
-    float excess = i2 - (FAULT_I_CONT * FAULT_I_CONT);
+    float excess = i2 - (s_cfg.i_cont * s_cfg.i_cont);
     s_i2t_accum += excess * dt;                   // integrate over/under continuous
     if (s_i2t_accum < 0.0f) s_i2t_accum = 0.0f;   // never bank credit
-    if (s_i2t_accum > FAULT_I2T_BUDGET) {
+    if (s_i2t_accum > s_cfg.i2t_budget) {
       fault_raise(FAULT_OVERLOAD_I2T, vbus, iq);
     }
   }
 
   // --- Overspeed (immediate) ---------------------------------------------
-  if (fabsf(rpm) > FAULT_OVERSPEED_RPM) {
+  if (fabsf(rpm) > s_cfg.overspeed_rpm) {
     fault_raise(FAULT_OVERSPEED, vbus, iq);
   }
 
   // --- Stall: torque current high but rotor not turning, sustained -------
-  if (driving && fabsf(iq) > FAULT_STALL_IQ && fabsf(rpm) < FAULT_STALL_RPM) {
+  if (driving && fabsf(iq) > s_cfg.stall_iq && fabsf(rpm) < s_cfg.stall_rpm) {
     if (s_stall_since == 0u) s_stall_since = tick_ms ? tick_ms : 1u;
     if ((tick_ms - s_stall_since) >= FAULT_STALL_MS) {
       fault_raise(FAULT_STALL, vbus, iq);
@@ -240,7 +287,7 @@ bool fault_try_clear(float vbus) {
   }
 
   // 2. Bus voltage must be back inside the safe window.
-  if (vbus > FAULT_VBUS_OV_TRIP || vbus < FAULT_VBUS_UV_TRIP) {
+  if (vbus > s_cfg.vbus_ov_trip || vbus < s_cfg.vbus_uv_trip) {
     return false;
   }
 
