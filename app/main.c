@@ -9,6 +9,105 @@
 
 static motor_t g_motor;
 
+/* ===================================================================
+ * Auto-calibration orchestrator (the `autocal` shell command).
+ *
+ * Runs the full commissioning sequence back-to-back, each stage being a foc
+ * state machine that returns to IDLE when done. A settle delay between stages
+ * lets residual current/motion decay so one measurement does not corrupt the
+ * next (e.g. the flux spin must fully stop before the J/B accel test). Results
+ * are captured by the edge logic in the main loop; gains are deployed here.
+ * =================================================================== */
+#define AUTOCAL_SETTLE_MS   1000u    /* inter-stage settle (cross-talk guard) */
+#define AUTOCAL_IMECH_IQ    1.0f     /* J/B test current */
+#define AUTOCAL_CUR_BW_HZ   1000.0f  /* current-loop bandwidth */
+#define AUTOCAL_SPD_BW_HZ   10.0f    /* speed-loop bandwidth */
+
+typedef enum {
+  AC_OFF = 0,
+  AC_BEGIN,
+  AC_ALIGN_WAIT,
+  AC_ALIGN_SETTLE,
+  AC_IDENT_WAIT,
+  AC_IDENT_SETTLE,
+  AC_IMECH_WAIT,
+  AC_DONE,
+} ac_phase_t;
+
+static ac_phase_t s_ac_phase = AC_OFF;
+static uint32_t   s_ac_delay;
+
+void autocal_start(void) { s_ac_phase = AC_BEGIN; s_ac_delay = 0u; }
+void autocal_abort(void) { s_ac_phase = AC_OFF; }
+bool autocal_active(void) { return s_ac_phase != AC_OFF; }
+
+/* Advance the sequence; call once per ~1 ms main-loop tick. */
+static void autocal_poll(motor_t *m) {
+  if (s_ac_phase == AC_OFF) {
+    return;
+  }
+  foc_state_t st = foc_get_state(m);
+  if (st == FOC_STATE_ERROR) {     /* a fault aborts the whole sequence */
+    s_ac_phase = AC_OFF;
+    return;
+  }
+
+  switch (s_ac_phase) {
+  case AC_BEGIN:
+    foc_start_calibration(m, 1);   /* current-offset cal + encoder alignment */
+    s_ac_phase = AC_ALIGN_WAIT;
+    break;
+
+  case AC_ALIGN_WAIT:
+    if (st == FOC_STATE_IDLE) {
+      if (!m->sensor.cur_offset.is_calibrated) { s_ac_phase = AC_OFF; break; }
+      s_ac_delay = AUTOCAL_SETTLE_MS;
+      s_ac_phase = AC_ALIGN_SETTLE;
+    }
+    break;
+
+  case AC_ALIGN_SETTLE:
+    if (s_ac_delay == 0u) {
+      foc_start_ident(m);          /* electrical: Rs/Ld/Lq/flux */
+      s_ac_phase = AC_IDENT_WAIT;
+    } else {
+      s_ac_delay--;
+    }
+    break;
+
+  case AC_IDENT_WAIT:
+    if (st == FOC_STATE_IDLE) {
+      if (params_get()->flux <= 0.0f) { s_ac_phase = AC_OFF; break; }
+      params_tune_current_loop(m, AUTOCAL_CUR_BW_HZ);  /* deploy current gains */
+      s_ac_delay = AUTOCAL_SETTLE_MS;
+      s_ac_phase = AC_IDENT_SETTLE;
+    }
+    break;
+
+  case AC_IDENT_SETTLE:
+    if (s_ac_delay == 0u) {
+      float kt = 1.5f * (float)HW_MOTOR_POLE_PAIRS * (params_get()->flux * 1.0e-3f);
+      foc_start_identmech(m, kt, AUTOCAL_IMECH_IQ);    /* mechanical: J/B/Tc */
+      s_ac_phase = AC_IMECH_WAIT;
+    } else {
+      s_ac_delay--;
+    }
+    break;
+
+  case AC_IMECH_WAIT:
+    if (st == FOC_STATE_IDLE) {
+      params_tune_speed_loop(m, AUTOCAL_SPD_BW_HZ);    /* deploy speed gains */
+      s_ac_phase = AC_DONE;
+    }
+    break;
+
+  case AC_DONE:
+  default:
+    s_ac_phase = AC_OFF;           /* params auto-save on the next IDLE poll */
+    break;
+  }
+}
+
 int main(void) {
     uart_init();
 
@@ -66,13 +165,25 @@ int main(void) {
         tick_ms++;
 
         // Auto-persist a calibration the moment an alignment run finishes (covers
-        // a shell-triggered `align`/`cali`; the boot alignment is captured above).
+        // boot alignment and the align stage of `autocal`).
         foc_state_t cur_state = foc_get_state(&g_motor);
         if (prev_state == FOC_STATE_CALI && cur_state == FOC_STATE_IDLE &&
             g_motor.cali.with_align) {
             params_capture_calibration(&g_motor);
         }
+        // Persist the identified motor parameters the moment an ident run finishes.
+        if (prev_state == FOC_STATE_IDENT && cur_state == FOC_STATE_IDLE) {
+            params_capture_ident(&g_motor);
+        }
+        // Persist the mechanical parameters when a J/B/Tc run finishes.
+        if (prev_state == FOC_STATE_IMECH && cur_state == FOC_STATE_IDLE) {
+            params_capture_identmech(&g_motor);
+        }
         prev_state = cur_state;
+
+        // Advance the auto-calibration sequence (no-op unless `autocal` running).
+        // Runs after the capture edges above so deployed gains see fresh results.
+        autocal_poll(&g_motor);
 
         // Flush any pending parameter change to flash — only fires in IDLE so a
         // flash erase never stalls an active control loop.
@@ -82,6 +193,8 @@ int main(void) {
         // need valid offsets, same as the fast path.
         uint8_t driving = (foc_get_state(&g_motor) != FOC_STATE_IDLE &&
                            foc_get_state(&g_motor) != FOC_STATE_ERROR &&
+                           foc_get_state(&g_motor) != FOC_STATE_CALI &&
+                           foc_get_state(&g_motor) != FOC_STATE_IDENT &&
                            g_motor.sensor.cur_offset.is_calibrated);
         fault_monitor_slow(motor_hw_get_vbus(),
                            g_motor.actual.iq, g_motor.target.iq, g_motor.actual.rpm,

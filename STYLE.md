@@ -157,13 +157,13 @@ void example(void) {
 // correct
 if (error > 0) {
   float x = a + b;
-  pid_init(&pid, kp, ki, kd, out_max, out_min);
+  pid_init(&pid, kp, ki, kd, ts, out_max, out_min);
 }
 
 // wrong
 if(error>0){                        // missing spaces
   float x=a+b;                      // missing spaces
-  pid_init(&pid,kp,ki,kd,out_max,out_min);  // missing spaces after commas
+  pid_init(&pid,kp,ki,kd,ts,out_max,out_min);  // missing spaces after commas
 }
 ```
 

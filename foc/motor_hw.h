@@ -32,7 +32,7 @@
 #define HW_ENCODER_ZERO_OFFSET 0.0f
 // Encoder counting direction relative to positive torque. If closed-loop locks
 // up / draws current without spinning, flip this to -1 and re-run calibration.
-#define HW_ENCODER_DIR        -1   // auto-detected during alignment calibration
+#define HW_ENCODER_DIR        1   // auto-detected during alignment calibration
 
 /* Control timing */
 #define HW_CONTROL_PERIOD_S   0.00005f
@@ -114,9 +114,6 @@ void motor_hw_get_currents(phase_currents_t *currents, const current_offset_t *o
 void motor_hw_start_encoder_read(void);
 
 void motor_hw_process_encoder_data(encoder_data_t *encoder);
-
-uint8_t motor_hw_calibrate_current_offset(current_offset_t *offset,
-                                          uint32_t adc_u, uint32_t adc_v, uint32_t adc_w);
 
 void motor_hw_debug_pin(uint8_t state);
 

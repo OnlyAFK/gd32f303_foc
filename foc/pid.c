@@ -1,9 +1,10 @@
 #include "pid.h"
 
-void pid_init(pid_t *pid, float kp, float ki, float kd, float out_max, float out_min) {
+void pid_init(pid_t *pid, float kp, float ki, float kd, float ts, float out_max, float out_min) {
   pid->kp = kp;
   pid->ki = ki;
   pid->kd = kd;
+  pid->ts = ts;
 
   pid->ref = 0.0f;
   pid->fdb = 0.0f;
@@ -41,49 +42,10 @@ float pi_calc(pid_t *pid, float ref, float fdb) {
 
   float p_out = pid->kp * error;
 
-  pid->integral += pid->ki * error;
+  pid->integral += pid->ki * error * pid->ts;
   pid->integral = clamp(pid->integral, pid->integral_min, pid->integral_max);
 
   pid->out = p_out + pid->integral;
-  pid->out = clamp(pid->out, pid->out_min, pid->out_max);
-
-  return pid->out;
-}
-
-float pid_calc(pid_t *pid, float ref, float fdb) {
-  pid->ref = ref;
-  pid->fdb = fdb;
-
-  float error = ref - fdb;
-
-  float p_out = pid->kp * error;
-
-  pid->integral += pid->ki * error;
-  pid->integral = clamp(pid->integral, pid->integral_min, pid->integral_max);
-
-  float d_out = pid->kd * (error - pid->last_error);
-  pid->last_error = error;
-
-  pid->out = p_out + pid->integral + d_out;
-  pid->out = clamp(pid->out, pid->out_min, pid->out_max);
-
-  return pid->out;
-}
-
-float pid_calc_incremental(pid_t *pid, float ref, float fdb) {
-  pid->ref = ref;
-  pid->fdb = fdb;
-
-  float error = ref - fdb;
-
-  float delta = pid->kp * (error - pid->last_error_1)
-              + pid->ki * error
-              + pid->kd * (error - 2.0f * pid->last_error_1 + pid->last_error_2);
-
-  pid->last_error_2 = pid->last_error_1;
-  pid->last_error_1 = error;
-
-  pid->out += delta;
   pid->out = clamp(pid->out, pid->out_min, pid->out_max);
 
   return pid->out;

@@ -77,6 +77,17 @@ static const kv_field_t s_fields[] = {
   KV_F("pos_rpm",   pos_max_rpm,        PT_F32),
   KV_F("pos_acc",   pos_max_accel,      PT_F32),
   KV_F("pos_jerk",  pos_max_jerk,       PT_F32),
+  KV_F("pos_kp",    pos_landing_kp,     PT_F32),
+  KV_F("pos_db",    pos_deadband,       PT_F32),
+  KV_F("rs",        rs,                 PT_F32),
+  KV_F("ld",        ld,                 PT_F32),
+  KV_F("lq",        lq,                 PT_F32),
+  KV_F("flux",      flux,               PT_F32),
+  KV_F("ident_ok",  ident_valid,        PT_U8),
+  KV_F("inertia",   inertia_j,          PT_F32),
+  KV_F("visc_b",    visc_b,             PT_F32),
+  KV_F("fric_tc",   friction_tc,        PT_F32),
+  KV_F("mech_ok",   mech_valid,         PT_U8),
   KV_F("thr_en",    thr.thr_protect_en, PT_U8),
   KV_F("thr_ovv",   thr.vbus_ov_trip,   PT_F32),
   KV_F("thr_uvv",   thr.vbus_uv_trip,   PT_F32),
@@ -175,6 +186,8 @@ static void params_from_motor(params_t *p, const motor_t *m) {
   p->pos_max_rpm     = m->ctrl.pos.max_rpm;
   p->pos_max_accel   = m->ctrl.pos.max_accel;
   p->pos_max_jerk    = m->ctrl.pos.max_jerk;
+  p->pos_landing_kp  = m->ctrl.pos.landing_kp;
+  p->pos_deadband    = m->ctrl.pos.deadband;
 }
 
 /* Push the parameter set into the motor through the existing foc setters (no
@@ -189,9 +202,11 @@ static void params_to_motor(const params_t *p, motor_t *m) {
   foc_set_limit(m, FOC_LIMIT_CURRENT,  p->cur_limit);
   foc_set_limit(m, FOC_LIMIT_SPEED,    p->spd_limit);
 
-  m->ctrl.pos.max_rpm   = p->pos_max_rpm;
-  m->ctrl.pos.max_accel = p->pos_max_accel;
-  m->ctrl.pos.max_jerk  = p->pos_max_jerk;
+  m->ctrl.pos.max_rpm    = p->pos_max_rpm;
+  m->ctrl.pos.max_accel  = p->pos_max_accel;
+  m->ctrl.pos.max_jerk   = p->pos_max_jerk;
+  m->ctrl.pos.landing_kp = p->pos_landing_kp;
+  m->ctrl.pos.deadband   = p->pos_deadband;
 
   /* protection thresholds (fault_set_cfg re-clamps to the hard bounds) */
   fault_set_cfg(&p->thr);
@@ -301,6 +316,53 @@ void params_capture_calibration(const motor_t *motor) {
   s_params.enc_dir         = motor->sensor.encoder.direction;
   s_params.cali_valid      = 1u;
   s_dirty = true;
+}
+
+void params_capture_ident(const motor_t *motor) {
+  s_params.rs   = motor->ident.rs;
+  s_params.ld   = motor->ident.ld;
+  s_params.lq   = motor->ident.lq;
+  s_params.flux = motor->ident.flux;
+  /* Mark the set valid only when the whole electrical sequence completed —
+   * flux is measured last, so a non-zero flux implies Rs/Ld/Lq are present too. */
+  s_params.ident_valid = (motor->ident.flux > 0.0f) ? 1u : 0u;
+  s_dirty = true;
+}
+
+void params_capture_identmech(const motor_t *motor) {
+  s_params.inertia_j   = motor->imech.j;
+  s_params.visc_b      = motor->imech.b;
+  s_params.friction_tc = motor->imech.tc;
+  s_params.mech_valid  = (motor->imech.j > 0.0f) ? 1u : 0u;
+  s_dirty = true;
+}
+
+void params_tune_current_loop(motor_t *motor, float bw_hz) {
+  /* Pole-zero cancellation: Kp = L*w_bw, Ki = R*w_bw (continuous; the PI scales
+   * Ki by Ts). Ld/Lq are stored in microhenries. */
+  if (s_params.rs <= 0.0f || s_params.ld <= 0.0f || s_params.lq <= 0.0f) {
+    return;
+  }
+  float w_bw = 2.0f * FOC_PI * bw_hz;
+  params_set(motor, "id_kp", (s_params.ld * 1.0e-6f) * w_bw);
+  params_set(motor, "id_ki", s_params.rs * w_bw);
+  params_set(motor, "iq_kp", (s_params.lq * 1.0e-6f) * w_bw);
+  params_set(motor, "iq_ki", s_params.rs * w_bw);
+}
+
+void params_tune_speed_loop(motor_t *motor, float bw_hz) {
+  /* Plant w/iq = Kt/(J*s+B); pole-zero cancellation gives (in A per rpm):
+   * Kp = (J*w_bw/Kt)*(2pi/60), Ki = (B*w_bw/Kt)*(2pi/60). J in g.cm^2, B in
+   * uNm.s/rad, flux in mWb. */
+  if (s_params.mech_valid == 0u || s_params.inertia_j <= 0.0f || s_params.flux <= 0.0f) {
+    return;
+  }
+  float j_si = s_params.inertia_j * 1.0e-7f;
+  float b_si = s_params.visc_b * 1.0e-6f;
+  float kt   = 1.5f * (float)HW_MOTOR_POLE_PAIRS * (s_params.flux * 1.0e-3f);
+  float w_bw = 2.0f * FOC_PI * bw_hz;
+  params_set(motor, "spd_kp", (j_si * w_bw / kt) * FOC_RPM_TO_RAD);
+  params_set(motor, "spd_ki", (b_si * w_bw / kt) * FOC_RPM_TO_RAD);
 }
 
 void params_factory_reset(motor_t *motor) {

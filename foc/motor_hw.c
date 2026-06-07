@@ -5,7 +5,6 @@
 #include "fault.h"
 #include <math.h>
 
-#define CALIBRATION_SAMPLES 1000u
 #define RAW_TO_RAD          (FOC_2PI / (float)HW_ENCODER_CPR)
 
 // Hardware emergency stop, invoked from the DRV8323 nFAULT EXTI ISR. Must be
@@ -129,33 +128,6 @@ void motor_hw_process_encoder_data(encoder_data_t *encoder) {
   encoder->elec_angle = normalize_angle(encoder->elec_angle);
 }
 
-uint8_t motor_hw_calibrate_current_offset(current_offset_t *offset,
-                                          uint32_t adc_u, uint32_t adc_v, uint32_t adc_w) {
-  static uint32_t sum_u = 0, sum_v = 0, sum_w = 0;
-  static uint32_t sample_count = 0;
-
-  if (offset->is_calibrated) {
-    return 1;
-  }
-
-  if (sample_count < CALIBRATION_SAMPLES) {
-    sum_u += adc_u;
-    sum_v += adc_v;
-    sum_w += adc_w;
-    sample_count++;
-    return 0;
-  }
-
-  offset->offset_u = (float)sum_u / (float)CALIBRATION_SAMPLES;
-  offset->offset_v = (float)sum_v / (float)CALIBRATION_SAMPLES;
-  offset->offset_w = (float)sum_w / (float)CALIBRATION_SAMPLES;
-  offset->is_calibrated = 1;
-
-  sum_u = sum_v = sum_w = 0;
-  sample_count = 0;
-
-  return 1;
-}
 
 void motor_hw_debug_pin(uint8_t state) {
   // No dedicated debug pin on this board; left as a no-op. Wire a spare GPIO

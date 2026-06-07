@@ -77,6 +77,11 @@ Any non-empty result from 2–4 is a layering leak to fix.
 
 ## Known debts
 
+- **`foc_core.c` size (~1100 lines)**: it now hosts the cascaded control loops
+  *and* the parameter-identification sub-state-machines (Rs/Ld/Lq/flux electrical
+  + J/B/Tc mechanical). These are self-contained (`ident_*`/`imech_*` helpers,
+  `ident_ctx_t`/`imech_ctx_t`) and a natural split into a `foc/foc_ident` module
+  when the file is next touched. No layering change — same `foc` layer.
 - **Telemetry coupling**: `vofa` lives in `foc/` and `foc_core` *pushes* to it
   each control cycle (control → telemetry inversion). Invert to a registered
   callback / pull model and move to a service dir when telemetry is reworked.

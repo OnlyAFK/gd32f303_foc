@@ -41,6 +41,24 @@ typedef struct {
   float pos_max_rpm;
   float pos_max_accel;
   float pos_max_jerk;
+  float pos_landing_kp;      /* near-target P gain [rad/s per rad] = position bandwidth */
+  float pos_deadband;        /* position deadband [rad] */
+
+  /* --- identified motor parameters (measured by FOC_STATE_IDENT) ---
+   * Deployed into the current loop via params_tune_current_loop (the `tune`
+   * command / autocal). ident_valid is set once the full electrical set is
+   * measured. */
+  float   rs;                /* stator resistance [ohm] */
+  float   ld;                /* d-axis inductance [uH] (1e6*H, for clean display) */
+  float   lq;                /* q-axis inductance [uH] */
+  float   flux;              /* PM flux linkage [mWb] (1e3*Wb, for clean display) */
+  uint8_t ident_valid;       /* 1 once Rs+Ld+Lq+flux have all been identified */
+
+  /* --- identified mechanical parameters (measured by FOC_STATE_IMECH) --- */
+  float   inertia_j;         /* rotor-side inertia [g.cm^2] (1e7*kg.m^2) */
+  float   visc_b;            /* viscous friction [uNm.s/rad] (1e6*Nm.s/rad) */
+  float   friction_tc;       /* Coulomb friction [mNm] (1e3*Nm) */
+  uint8_t mech_valid;        /* 1 once J/B/Tc have been identified */
 
   /* --- protection thresholds (VESC-style guard lives in fault.c) --- */
   fault_cfg_t thr;
@@ -72,6 +90,22 @@ void params_poll_save(motor_t *motor);
  * into the parameter set and mark dirty, so a fresh calibration persists. Call
  * on the calibration-done edge. */
 void params_capture_calibration(const motor_t *motor);
+
+/* Capture the motor's identified parameters (Rs/Ld/Lq/flux) into the parameter
+ * set and mark dirty. Call on the IDENT-done edge (state IDENT -> IDLE). */
+void params_capture_ident(const motor_t *motor);
+
+/* Capture the motor's identified mechanical parameters (J/B/Tc) into the
+ * parameter set and mark dirty. Call on the IMECH-done edge (IMECH -> IDLE). */
+void params_capture_identmech(const motor_t *motor);
+
+/* Compute and apply the current-loop / speed-loop PI gains from the identified
+ * parameters at a closed-loop bandwidth `bw_hz`, persisting them (no-op if the
+ * required parameters have not been identified). Current loop uses Rs/Ld/Lq;
+ * speed loop uses J/B and the flux-derived torque constant. Shared by the
+ * `tune`/`tunespd` shell commands and the autocal orchestrator. */
+void params_tune_current_loop(motor_t *motor, float bw_hz);
+void params_tune_speed_loop(motor_t *motor, float bw_hz);
 
 /* Restore factory defaults (the foc_init() values captured at params_init),
  * apply them to `motor`, and persist immediately. */

@@ -19,8 +19,8 @@
  *   MAJOR  - major release -> also resets params (the gate is MAJOR.MINOR).
  */
 #define FW_VER_MAJOR   0
-#define FW_VER_MINOR   1
-#define FW_VER_PATCH   0
+#define FW_VER_MINOR   2
+#define FW_VER_PATCH   4
 
 /* Packed as 0x00MMmmpp (major/minor/patch, each 0..255). */
 #define FW_VER_U32     (((uint32_t)FW_VER_MAJOR << 16) | \

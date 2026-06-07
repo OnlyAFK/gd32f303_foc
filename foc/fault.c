@@ -238,7 +238,9 @@ void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
   }
 
   // --- Overspeed (immediate) ---------------------------------------------
-  if (fabsf(rpm) > s_cfg.overspeed_rpm) {
+  // Only check while actively driving; during calibration alignment the rotor
+  // snaps to the lock position and the PLL transiently reports a false high speed.
+  if (driving && fabsf(rpm) > s_cfg.overspeed_rpm) {
     fault_raise(FAULT_OVERSPEED, vbus, iq);
   }
 

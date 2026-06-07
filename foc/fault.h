@@ -89,7 +89,7 @@ typedef enum {
 #define FAULT_STALL_MS        1000u
 
 /* Overspeed (mechanical RPM). */
-#define FAULT_OVERSPEED_RPM   2000.0f
+#define FAULT_OVERSPEED_RPM   2500.0f
 
 /* Phase loss: commanding real torque current but the measured phase currents
  * stay near zero -> open winding / disconnected motor. Gated on a meaningful

@@ -11,6 +11,7 @@
 #include "vofa.h"
 #include "motor_hw.h"
 #include "foc_math.h"
+#include "main.h"
 
 // Number of VOFA channels streamed in scope mode (channels 0..SPEED_TARGET).
 #define SCOPE_CHANNELS  (VOFA_CH_SPEED_TARGET + 1)
@@ -99,6 +100,8 @@ static const char *state_name(foc_state_t s) {
   case FOC_STATE_CURRENT:         return "CURRENT";
   case FOC_STATE_SPEED:           return "SPEED";
   case FOC_STATE_POSITION:        return "POSITION";
+  case FOC_STATE_IDENT:           return "IDENT";
+  case FOC_STATE_IMECH:           return "IMECH";
   case FOC_STATE_ERROR:           return "ERROR";
   default:                        return "?";
   }
@@ -185,30 +188,96 @@ static int cmd_volt(int argc, char *argv[]) {
   return 0;
 }
 
-static int cmd_cali(int argc, char *argv[]) {
+static int cmd_autocal(int argc, char *argv[]) {
   (void)argc; (void)argv;
   if (foc_get_state(s_motor) != FOC_STATE_IDLE) {
     shellWriteString(&s_shell, "need IDLE first (use 'stop')\r\n");
     return 0;
   }
-  foc_start_calibration(s_motor, 0);
-  shellWriteString(&s_shell, "calibrating current offset...\r\n");
+  autocal_start();
+  shellWriteString(&s_shell, "auto-calibration started (~45 s):\r\n");
+  shellWriteString(&s_shell, "  cal+align -> Rs/Ld/Lq/flux -> J/B/Tc, gains auto-deployed\r\n");
+  shellWriteString(&s_shell, "  rotor MOVES then SPINS - keep clear! watch 'status'\r\n");
   return 0;
 }
 
-static int cmd_align(int argc, char *argv[]) {
+// Raw identification measurements (for cross-checking the result). Reads the
+// last ident run straight from the motor struct.
+static int cmd_identinfo(int argc, char *argv[]) {
   (void)argc; (void)argv;
+  const ident_ctx_t *c = &s_motor->ident;
+  shellWriteString(&s_shell, "Rs (two-point DC):\r\n");
+  print_f("  vd_low_V", c->vd_low);
+  print_f("  vd_high_V", c->vd_high);
+  print_f("  id_low_A", c->id_low);
+  print_f("  id_high_A", c->id_high);
+  print_f("  rs_ohm", c->rs);
+  shellWriteString(&s_shell, "Ld/Lq (square-wave injection):\r\n");
+  print_f("  vd_bias_V", c->vd_bias);
+  print_f("  ld_pp_lo_A", c->ld_pp_low);
+  print_f("  ld_pp_hi_A", c->ld_pp_high);
+  print_f("  ld_uH", c->ld);
+  print_f("  lq_pp_lo_A", c->lq_pp_low);
+  print_f("  lq_pp_hi_A", c->lq_pp_high);
+  print_f("  lq_uH", c->lq);
+  shellWriteString(&s_shell, "flux (Iq=0 coast):\r\n");
+  print_f("  flux_mWb", c->flux);
+  shellWriteString(&s_shell, "mechanical (J/B/Tc):\r\n");
+  print_f("  J_g.cm2", s_motor->imech.j);
+  print_f("  B_uNm.s", s_motor->imech.b);
+  print_f("  Tc_mNm", s_motor->imech.tc);
+  return 0;
+}
+
+// Re-deploy the current-loop PI gains from the stored Rs/Ld/Lq at a chosen
+// bandwidth (default 1 kHz) without re-identifying: Kp = L*w_bw, Ki = R*w_bw
+// (continuous; the integrator scales Ki by Ts). Pole-zero cancellation ->
+// first-order closed loop. autocal does this automatically.
+static int cmd_tune(int argc, char *argv[]) {
   if (foc_get_state(s_motor) != FOC_STATE_IDLE) {
     shellWriteString(&s_shell, "need IDLE first (use 'stop')\r\n");
     return 0;
   }
-  foc_start_calibration(s_motor, 1);
-  shellWriteString(&s_shell, "aligning encoder (rotor will move)...\r\n");
+  const params_t *p = params_get();
+  if (p->rs <= 0.0f || p->ld <= 0.0f || p->lq <= 0.0f) {
+    shellWriteString(&s_shell, "no ident data; run 'autocal' first\r\n");
+    return 0;
+  }
+  float bw = (argc >= 2) ? arg_f(argv[1]) : 1000.0f;
+  params_tune_current_loop(s_motor, bw);
+  shellPrint(&s_shell, "tuned current loop @ %d Hz from Rs/Ld/Lq:\r\n", (int)bw);
+  print_f("  id_kp", p->id_kp);
+  print_f("  id_ki", p->id_ki);
+  print_f("  iq_kp", p->iq_kp);
+  print_f("  iq_ki", p->iq_ki);
+  shellWriteString(&s_shell, "applied; auto-saves in IDLE\r\n");
+  return 0;
+}
+
+// Re-deploy the speed-loop gains from the stored J/B at a chosen bandwidth
+// (default 10 Hz) without re-identifying.
+static int cmd_tunespd(int argc, char *argv[]) {
+  if (foc_get_state(s_motor) != FOC_STATE_IDLE) {
+    shellWriteString(&s_shell, "need IDLE first (use 'stop')\r\n");
+    return 0;
+  }
+  const params_t *p = params_get();
+  if (!p->mech_valid || p->inertia_j <= 0.0f || p->flux <= 0.0f) {
+    shellWriteString(&s_shell, "no J/B data; run 'autocal' first\r\n");
+    return 0;
+  }
+  float bw = (argc >= 2) ? arg_f(argv[1]) : 10.0f;
+  params_tune_speed_loop(s_motor, bw);
+  shellPrint(&s_shell, "tuned speed loop @ %d Hz from J/B:\r\n", (int)bw);
+  print_f("  spd_kp", p->spd_kp);
+  print_f("  spd_ki", p->spd_ki);
+  shellWriteString(&s_shell, "applied; auto-saves in IDLE\r\n");
   return 0;
 }
 
 static int cmd_stop(int argc, char *argv[]) {
   (void)argc; (void)argv;
+  autocal_abort();                 /* cancel any running auto-calibration */
   foc_set_state(s_motor, FOC_STATE_IDLE);
   shellWriteString(&s_shell, "stop -> IDLE\r\n");
   return 0;
@@ -220,6 +289,9 @@ static int cmd_status(int argc, char *argv[]) {
 
   shellPrint(&s_shell, "fw = %s\r\n", FW_VER_STRING);
   shellPrint(&s_shell, "mode = %s\r\n", state_name(foc_get_state(s_motor)));
+  if (autocal_active()) {
+    shellWriteString(&s_shell, "autocal: RUNNING (do not interrupt)\r\n");
+  }
   print_f("vbus_V", motor_hw_get_vbus());
 
   shellWriteString(&s_shell, "target:\r\n");
@@ -479,8 +551,10 @@ const ShellCommand shellCommandList[] = {
   SHELL_CMD_ITEM(CMD_ATTR, iq, cmd_iq, set/show q-axis current (A)),
   SHELL_CMD_ITEM(CMD_ATTR, pos, cmd_pos, set/show position target (DEGREES)),
   SHELL_CMD_ITEM(CMD_ATTR, volt, cmd_volt, set voltage: volt <vd> <vq>),
-  SHELL_CMD_ITEM(CMD_ATTR, cali, cmd_cali, calibrate current offset (needs IDLE)),
-  SHELL_CMD_ITEM(CMD_ATTR, align, cmd_align, calibrate + encoder align (rotor moves)),
+  SHELL_CMD_ITEM(CMD_ATTR, autocal, cmd_autocal, full auto-calibration: align+ident+deploy (rotor moves/spins)),
+  SHELL_CMD_ITEM(CMD_ATTR, identinfo, cmd_identinfo, show raw measurements of the last autocal run),
+  SHELL_CMD_ITEM(CMD_ATTR, tune, cmd_tune, re-deploy current-loop gains: tune [bw_hz]),
+  SHELL_CMD_ITEM(CMD_ATTR, tunespd, cmd_tunespd, re-deploy speed-loop gains: tunespd [bw_hz]),
   SHELL_CMD_ITEM(CMD_ATTR, stop, cmd_stop, stop -> IDLE),
   SHELL_CMD_ITEM(CMD_ATTR, status, cmd_status, show mode + targets + actuals + faults),
   SHELL_CMD_ITEM(CMD_ATTR, dump, cmd_dump, print all telemetry channels (text VOFA frame)),
