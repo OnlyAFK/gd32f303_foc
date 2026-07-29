@@ -50,7 +50,7 @@ static fault_log_t s_flog;
  * absent in flash keep their seeded default; new firmware fields therefore
  * default cleanly on an old database without a migration step.
  * =================================================================== */
-typedef enum { PT_F32, PT_I32, PT_U8 } ptype_t;
+typedef enum { PT_F32, PT_I32, PT_U8, PT_U16 } ptype_t;
 
 typedef struct {
   const char *key;   /* doubles as the shell name for get/set */
@@ -58,7 +58,13 @@ typedef struct {
   ptype_t     type;
 } kv_field_t;
 
-static uint16_t field_size(ptype_t t) { return (t == PT_U8) ? 1u : 4u; }
+static uint16_t field_size(ptype_t t) {
+  switch (t) {
+  case PT_U8:  return 1u;
+  case PT_U16: return 2u;
+  default:     return 4u;   /* PT_F32 / PT_I32 */
+  }
+}
 
 #define KV_F(name, member, ty) { name, (uint16_t)offsetof(params_t, member), ty }
 
@@ -97,6 +103,8 @@ static const kv_field_t s_fields[] = {
   KV_F("thr_stiq",  thr.stall_iq,       PT_F32),
   KV_F("thr_strpm", thr.stall_rpm,      PT_F32),
   KV_F("thr_ospd",  thr.overspeed_rpm,  PT_F32),
+  KV_F("can_id",    can_id,             PT_U8),
+  KV_F("can_wdog",  can_wdog_ms,        PT_U16),
 };
 #define KV_FIELD_COUNT (sizeof(s_fields) / sizeof(s_fields[0]))
 
@@ -106,6 +114,7 @@ static float field_read_f(const kv_field_t *f) {
   switch (f->type) {
   case PT_I32: return (float)(*(const int32_t *)p);
   case PT_U8:  return (float)(*(const uint8_t *)p);
+  case PT_U16: return (float)(*(const uint16_t *)p);
   default:     return *(const float *)p;
   }
 }
@@ -115,6 +124,7 @@ static void field_write_f(const kv_field_t *f, float v) {
   switch (f->type) {
   case PT_I32: *(int32_t *)p = (int32_t)v; break;
   case PT_U8:  *(uint8_t *)p = (uint8_t)v; break;
+  case PT_U16: *(uint16_t *)p = (uint16_t)v; break;
   default:     *(float *)p = v;            break;
   }
 }
@@ -142,7 +152,8 @@ static const kv_field_t *field_find(const char *name) {
   return NULL;
 }
 
-static void save_fields(bool force);   /* defined below; used by params_init */
+static void save_fields(bool force);          /* defined below; used by params_init */
+static void load_acog_from_flash(motor_t *m); /* defined below; used by params_init */
 
 /* ===================================================================
  * Stored-version guard.
@@ -220,8 +231,10 @@ void params_init(motor_t *motor) {
   /* defaults = whatever foc_init() just put in the motor + the fault module's
    * compile-time threshold defaults; no stored calibration */
   params_from_motor(&s_defaults, motor);
-  s_defaults.cali_valid = 0u;
-  s_defaults.thr        = *fault_get_cfg();
+  s_defaults.cali_valid  = 0u;
+  s_defaults.thr         = *fault_get_cfg();
+  s_defaults.can_id      = 1u;   /* node 1 by default (0 is broadcast) */
+  s_defaults.can_wdog_ms = 0u;   /* command-loss watchdog off by default */
   s_params = s_defaults;
   s_saved  = s_defaults;   /* an empty/absent flash maps to the defaults */
 
@@ -262,6 +275,7 @@ void params_init(motor_t *motor) {
   if (compatible) {
     struct fdb_blob blob;
     fdb_kv_get_blob(&s_kvdb, "fault_log", fdb_blob_make(&blob, &s_flog, sizeof(s_flog)));
+    load_acog_from_flash(motor);   /* restore a stored anti-cogging map */
   }
 
   params_to_motor(&s_params, motor);
@@ -335,6 +349,46 @@ void params_capture_identmech(const motor_t *motor) {
   s_params.friction_tc = motor->imech.tc;
   s_params.mech_valid  = (motor->imech.j > 0.0f) ? 1u : 0u;
   s_dirty = true;
+}
+
+/* Anti-cogging map blob KV. Kept out of the field table (it is ~1 KB, far larger
+ * than any scalar) and written immediately like the fault log rather than via
+ * the deferred dirty/IDLE path — the callers already guarantee the motor is
+ * IDLE. The blob is owned/serialised by foc_acog (int8 + scale). */
+#define KEY_ACOG  "cogging"
+
+void params_capture_acog(const motor_t *motor) {
+  struct fdb_blob blob;
+  uint32_t len = 0u;
+  const void *p;
+
+  if (!s_mounted) {
+    return;
+  }
+  p = foc_acog_blob(motor, &len);
+  if (p != NULL && len > 0u) {
+    fdb_kv_set_blob(&s_kvdb, KEY_ACOG, fdb_blob_make(&blob, (void *)p, len));
+  } else {
+    fdb_kv_del(&s_kvdb, KEY_ACOG);   /* invalid map: drop any stale stored copy */
+  }
+}
+
+/* Load a stored anti-cogging map (if any) straight into foc_acog's live table.
+ * Internal to params_init; absent/short/invalid blob leaves the map disabled. */
+static void load_acog_from_flash(motor_t *motor) {
+  struct fdb_blob blob;
+  uint32_t maxlen = 0u;
+  void *buf;
+  size_t got;
+
+  if (!s_mounted) {
+    return;
+  }
+  buf = foc_acog_load_buffer(&maxlen);
+  got = fdb_kv_get_blob(&s_kvdb, KEY_ACOG, fdb_blob_make(&blob, buf, maxlen));
+  if (got > 0u) {
+    foc_acog_load_commit(motor, (uint32_t)got);
+  }
 }
 
 void params_tune_current_loop(motor_t *motor, float bw_hz) {

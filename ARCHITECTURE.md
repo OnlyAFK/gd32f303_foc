@@ -16,7 +16,7 @@ app/        main, interrupt vectors, app wiring, CLI, telemetry, params/flash
 foc/        control + protection + hardware abstraction
   |
 driver/     external chips (drv8323 gate driver, tle5012b encoder)
-bsp/        on-chip peripherals (uart, pwm_curr/ADC, flash_port, future usb)
+bsp/        on-chip peripherals (uart, can, pwm_curr/ADC, flash_port, future usb)
   |
 libraries/  vendor code (CMSIS, GD32 SPL, lwrb, CMSIS-DSP, letter-shell, flashdb)
 ```
@@ -33,8 +33,10 @@ libraries/  vendor code (CMSIS, GD32 SPL, lwrb, CMSIS-DSP, letter-shell, flashdb
 | `vofa` | foc* | Telemetry formatting (see Known debts) |
 | `drv8323`, `tle5012b` | driver | Chip drivers; self-contained |
 | `uart`, `pwm_curr` | bsp | On-chip peripheral setup + access |
+| `can` | bsp | CAN0 frame transport (PA11/PA12, 1 Mbps); `can_bus_*` frame API, NOT an `io_stream` backend |
+| `can_proto` | app | CAN application protocol: `ID = node<<5 | cmd`, command frames -> foc setters, periodic telemetry, command watchdog. Peer to `shell_port` — a second front-end onto the motor, no control logic of its own |
 | `flash_port` | bsp | FAL on-chip flash device (GD32 FMC) for FlashDB; UART log sink. Uses SPL only (feeds the watchdog via SPL to avoid a foc dep) |
-| `io_stream` | bsp | Transport interface (write/read fn ptrs); `uart_stream()` is the backend |
+| `io_stream` | bsp | Byte-stream transport interface (write/read fn ptrs); `uart_stream()` is the backend. CAN is frame-based and stays off this interface |
 | `letter-shell` | libraries | Third-party command shell (export-OFF, manual command table) |
 | `flashdb` | libraries | Third-party KV store (KVDB-only) over FAL; top 8 KB of flash |
 | `shell_port` | app | letter-shell glue: io_stream binding, command table, `scope` mode |
@@ -77,11 +79,11 @@ Any non-empty result from 2–4 is a layering leak to fix.
 
 ## Known debts
 
-- **`foc_core.c` size (~1100 lines)**: it now hosts the cascaded control loops
-  *and* the parameter-identification sub-state-machines (Rs/Ld/Lq/flux electrical
-  + J/B/Tc mechanical). These are self-contained (`ident_*`/`imech_*` helpers,
-  `ident_ctx_t`/`imech_ctx_t`) and a natural split into a `foc/foc_ident` module
-  when the file is next touched. No layering change — same `foc` layer.
+- **`foc_core.c` (~690 lines)**: hosts the cascaded control loops. The
+  parameter-identification sub-state-machines (Rs/Ld/Lq/flux electrical +
+  J/B/Tc mechanical) have been split into `foc/foc_ident`, and the anti-cogging
+  sweep into `foc/foc_acog`; `foc_core` calls their per-tick hooks from the
+  control ISR. No longer a split candidate on its own.
 - **Telemetry coupling**: `vofa` lives in `foc/` and `foc_core` *pushes* to it
   each control cycle (control → telemetry inversion). Invert to a registered
   callback / pull model and move to a service dir when telemetry is reworked.

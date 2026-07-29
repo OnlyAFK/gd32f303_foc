@@ -8,7 +8,7 @@
 #define UART_GPIO_PORT     GPIOB
 #define UART_TX_PIN        GPIO_PIN_10
 #define UART_RX_PIN        GPIO_PIN_11
-#define UART_BAUDRATE      3000000U
+#define UART_BAUDRATE      115200U
 
 // USART2_TX -> DMA0 channel1, USART2_RX -> DMA0 channel2 (fixed mapping).
 #define UART_DMA           DMA0
@@ -16,8 +16,8 @@
 #define UART_DMA_RX_CH     DMA_CH2
 
 // Ring buffer sizes. lwrb keeps one slot reserved, so usable size is N-1.
-#define UART_TX_RB_SIZE    1024U
-#define UART_RX_RB_SIZE    1024U
+#define UART_TX_RB_SIZE    4096U
+#define UART_RX_RB_SIZE    4096U
 // Hardware DMA landing buffer for RX. IDLE + half/full events drain it.
 #define UART_RX_DMA_SIZE   256U
 

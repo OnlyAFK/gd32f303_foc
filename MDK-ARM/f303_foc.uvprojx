@@ -553,6 +553,11 @@
               <FileType>5</FileType>
               <FilePath>..\app\version.h</FilePath>
             </File>
+            <File>
+              <FileName>can_proto.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\can_proto.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -562,6 +567,11 @@
               <FileName>uart.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\bsp\uart.c</FilePath>
+            </File>
+            <File>
+              <FileName>can.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\bsp\can.c</FilePath>
             </File>
             <File>
               <FileName>pwm_curr.c</FileName>
@@ -597,6 +607,16 @@
               <FileName>foc_core.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\foc\foc_core.c</FilePath>
+            </File>
+            <File>
+              <FileName>foc_acog.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\foc\foc_acog.c</FilePath>
+            </File>
+            <File>
+              <FileName>foc_ident.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\foc\foc_ident.c</FilePath>
             </File>
             <File>
               <FileName>fault.c</FileName>

@@ -12,11 +12,17 @@
 #include "motor_hw.h"
 #include "foc_math.h"
 #include "main.h"
+#include "can.h"
+#include "can_proto.h"
 
 // Number of VOFA channels streamed in scope mode (channels 0..SPEED_TARGET).
 #define SCOPE_CHANNELS  (VOFA_CH_SPEED_TARGET + 1)
 
-#define SHELL_BUFFER_SIZE  128u
+// letter-shell splits this buffer across the edit line + SHELL_HISTORY_MAX_NUMBER
+// history slots (shell.c: bufferSize = size / (HISTORY+1)). With 5 history slots
+// the usable command length is only SIZE/6 - 1, so keep this generous: 512 -> ~84
+// chars per line, enough for the longest command + args.
+#define SHELL_BUFFER_SIZE  512u
 #define DEG_TO_RAD         (FOC_PI / 180.0f)
 #define RAD_TO_DEG         (180.0f / FOC_PI)
 
@@ -102,6 +108,7 @@ static const char *state_name(foc_state_t s) {
   case FOC_STATE_POSITION:        return "POSITION";
   case FOC_STATE_IDENT:           return "IDENT";
   case FOC_STATE_IMECH:           return "IMECH";
+  case FOC_STATE_ACOG:            return "ACOG";
   case FOC_STATE_ERROR:           return "ERROR";
   default:                        return "?";
   }
@@ -280,6 +287,132 @@ static int cmd_stop(int argc, char *argv[]) {
   autocal_abort();                 /* cancel any running auto-calibration */
   foc_set_state(s_motor, FOC_STATE_IDLE);
   shellWriteString(&s_shell, "stop -> IDLE\r\n");
+  return 0;
+}
+
+// Anti-cogging map: calibrate / enable / disable / clear / info.
+//   acog cal [rpm]  start a calibration sweep (steps 1 rev each way; ~3.5 min)
+//   acog on|off     enable/disable the run-time feed-forward (persisted in IDLE)
+//   acog clear      discard the map (deletes the stored copy)
+//   acog            show map status
+static void acog_print_info(void) {
+  shellPrint(&s_shell, "acog: valid=%d enabled=%d\r\n",
+             (int)foc_acog_is_valid(s_motor), (int)foc_acog_is_enabled(s_motor));
+  print_f("  peak_A", foc_acog_peak(s_motor));
+}
+
+static int cmd_acog(int argc, char *argv[]) {
+  if (argc < 2) {
+    acog_print_info();
+    shellWriteString(&s_shell, "usage: acog <cal [rpm]|on|off|clear|info>\r\n");
+    return 0;
+  }
+  const char *sub = argv[1];
+
+  if (strcmp(sub, "cal") == 0) {
+    if (foc_get_state(s_motor) != FOC_STATE_IDLE) {
+      shellWriteString(&s_shell, "need IDLE first (use 'stop')\r\n");
+      return 0;
+    }
+    if (!params_get()->cali_valid) {
+      shellWriteString(&s_shell, "encoder not aligned; run 'autocal' first\r\n");
+      return 0;
+    }
+    if (!s_motor->sensor.cur_offset.is_calibrated) {
+      shellWriteString(&s_shell, "current offsets not calibrated\r\n");
+      return 0;
+    }
+    float rpm = (argc >= 3) ? arg_f(argv[2]) : 0.0f;   /* 0 -> default creep */
+    foc_start_acog(s_motor, rpm, 0.0f);
+    shellWriteString(&s_shell, "anti-cogging cal started (~3.5 min):\r\n");
+    shellWriteString(&s_shell, "  rotor STEPS one rev each way - keep clear! watch 'status'\r\n");
+  } else if (strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
+    uint8_t on = (sub[1] == 'n');                      /* "on" vs "off" */
+    foc_acog_set_enable(s_motor, on);
+    if (foc_get_state(s_motor) == FOC_STATE_IDLE) {
+      params_capture_acog(s_motor);                    /* persist the enable flag */
+      shellPrint(&s_shell, "acog %s (saved)\r\n", on ? "on" : "off");
+    } else {
+      shellPrint(&s_shell, "acog %s (live; stop to persist)\r\n", on ? "on" : "off");
+    }
+  } else if (strcmp(sub, "clear") == 0) {
+    foc_acog_clear(s_motor);
+    if (foc_get_state(s_motor) == FOC_STATE_IDLE) {
+      params_capture_acog(s_motor);                    /* invalid map -> deletes KV */
+    }
+    shellWriteString(&s_shell, "acog map cleared\r\n");
+  } else if (strcmp(sub, "info") == 0) {
+    acog_print_info();
+  } else {
+    shellWriteString(&s_shell, "usage: acog <cal [rpm]|on|off|clear|info>\r\n");
+  }
+  return 0;
+}
+
+// CAN low-level debug hooks (kept alongside the can_proto layer for raw bus
+// debugging; they carry no protocol semantics).
+//   cansend <id_hex> [b0 ... b7]  send one standard data frame (bytes in hex)
+//   canstat                       show bus stats and drain received frames
+static int cmd_cansend(int argc, char *argv[]) {
+  if (argc < 2) {
+    shellWriteString(&s_shell, "usage: cansend <id_hex> [b0..b7] (hex)\r\n");
+    return 0;
+  }
+  uint32_t id = strtoul(argv[1], NULL, 16);
+  uint8_t data[8] = {0};
+  uint8_t dlc = (uint8_t)(argc - 2);
+  if (dlc > 8u) {
+    dlc = 8u;
+  }
+  for (uint8_t i = 0u; i < dlc; i++) {
+    data[i] = (uint8_t)strtoul(argv[2 + i], NULL, 16);
+  }
+  if (can_bus_send(id, dlc, data)) {
+    shellPrint(&s_shell, "can tx id=0x%03X dlc=%d\r\n", (unsigned int)id, (int)dlc);
+  } else {
+    shellWriteString(&s_shell, "can tx failed: no free mailbox (no bus / no ack?)\r\n");
+  }
+  return 0;
+}
+
+static int cmd_canstat(int argc, char *argv[]) {
+  (void)argc; (void)argv;
+  uint16_t dropped;
+  uint8_t tec, rec;
+  can_bus_get_stats(&dropped, &tec, &rec);
+  shellPrint(&s_shell, "can: TEC=%d REC=%d rx_dropped=%d\r\n",
+             (int)tec, (int)rec, (int)dropped);
+  can_frame_t f;
+  uint8_t n = 0u;
+  while (n < 16u && can_bus_recv(&f)) {
+    shellPrint(&s_shell, "  rx id=0x%03X dlc=%d data=", (unsigned int)f.id, (int)f.dlc);
+    for (uint8_t i = 0u; i < f.dlc; i++) {
+      shellPrint(&s_shell, "%02X ", (unsigned int)f.data[i]);
+    }
+    shellWriteString(&s_shell, "\r\n");
+    n++;
+  }
+  if (n == 0u) {
+    shellWriteString(&s_shell, "  (no rx frames)\r\n");
+  }
+  return 0;
+}
+
+// CAN protocol-layer status: node id, telemetry/watchdog state, rx/tx counts.
+// (Low-level bus stats + raw frame drain are still `canstat`.)
+static int cmd_canproto(int argc, char *argv[]) {
+  (void)argc; (void)argv;
+  can_proto_stats_t s;
+  can_proto_get_stats(&s);
+  shellPrint(&s_shell, "canproto: node=%d telem=%s wdog=%s",
+             (int)s.node_id, s.telem_enabled ? "on" : "off",
+             s.wdog_enabled ? "on" : "off");
+  if (s.wdog_enabled) {
+    shellPrint(&s_shell, " (%dms, remain %dms)", (int)s.wdog_ms, (int)s.wdog_remain_ms);
+  }
+  shellPrint(&s_shell, "\r\n  rx_cmds=%d rx_unknown=%d tx_telem=%d last_cmd=0x%02X\r\n",
+             (int)s.rx_cmds, (int)s.rx_unknown, (int)s.tx_telem, (unsigned)s.last_cmd);
+  shellWriteString(&s_shell, "  (set node with 'set can_id N', watchdog with 'set can_wdog ms')\r\n");
   return 0;
 }
 
@@ -555,6 +688,10 @@ const ShellCommand shellCommandList[] = {
   SHELL_CMD_ITEM(CMD_ATTR, identinfo, cmd_identinfo, show raw measurements of the last autocal run),
   SHELL_CMD_ITEM(CMD_ATTR, tune, cmd_tune, re-deploy current-loop gains: tune [bw_hz]),
   SHELL_CMD_ITEM(CMD_ATTR, tunespd, cmd_tunespd, re-deploy speed-loop gains: tunespd [bw_hz]),
+  SHELL_CMD_ITEM(CMD_ATTR, acog, cmd_acog, anti-cogging map: acog <cal [rpm]|on|off|clear|info>),
+  SHELL_CMD_ITEM(CMD_ATTR, cansend, cmd_cansend, CAN debug: cansend <id_hex> [b0..b7] (hex)),
+  SHELL_CMD_ITEM(CMD_ATTR, canstat, cmd_canstat, CAN debug: bus stats + drain rx frames),
+  SHELL_CMD_ITEM(CMD_ATTR, canproto, cmd_canproto, CAN protocol status: node/telem/wdog/counters),
   SHELL_CMD_ITEM(CMD_ATTR, stop, cmd_stop, stop -> IDLE),
   SHELL_CMD_ITEM(CMD_ATTR, status, cmd_status, show mode + targets + actuals + faults),
   SHELL_CMD_ITEM(CMD_ATTR, dump, cmd_dump, print all telemetry channels (text VOFA frame)),

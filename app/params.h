@@ -62,6 +62,10 @@ typedef struct {
 
   /* --- protection thresholds (VESC-style guard lives in fault.c) --- */
   fault_cfg_t thr;
+
+  /* --- CAN protocol layer (app/can_proto) --- */
+  uint8_t  can_id;           /* this node's CAN address, 1..63 (ID = node<<5 | cmd) */
+  uint16_t can_wdog_ms;      /* command-loss watchdog [ms]; 0 = disabled (default) */
 } params_t;
 
 /* Mount the KVDB, load stored values over the foc_init() defaults, and push the
@@ -69,7 +73,8 @@ typedef struct {
  * fails the system keeps running on the in-RAM defaults (no persistence). */
 void params_init(motor_t *motor);
 
-/* Read-only/!mutable access to the live parameter set (shell get/set). */
+/* Access to the live parameter set (shell get/set). Treat as read-only outside
+ * params.c — mutations bypass the dirty/save tracking. */
 params_t *params_get(void);
 
 /* Flush the entire parameter set RAM -> flash now. Heavy (flash erase/program);
@@ -98,6 +103,12 @@ void params_capture_ident(const motor_t *motor);
 /* Capture the motor's identified mechanical parameters (J/B/Tc) into the
  * parameter set and mark dirty. Call on the IMECH-done edge (IMECH -> IDLE). */
 void params_capture_identmech(const motor_t *motor);
+
+/* Persist (or, if the map is invalid, delete) the anti-cogging map as a compact
+ * blob KV ("cogging"). Unlike the small fields this writes flash immediately, so
+ * call it only with the motor IDLE — e.g. on the ACOG-done edge (ACOG -> IDLE)
+ * or after the `acog on/off` shell toggle so the enable flag survives a reboot. */
+void params_capture_acog(const motor_t *motor);
 
 /* Compute and apply the current-loop / speed-loop PI gains from the identified
  * parameters at a closed-loop bandwidth `bw_hz`, persisting them (no-op if the

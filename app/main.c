@@ -1,10 +1,12 @@
 #include "main.h"
 #include "uart.h"
+#include "can.h"
 #include "foc_core.h"
 #include "foc_math.h"
 #include "fault.h"
 #include "params.h"
 #include "shell_port.h"
+#include "can_proto.h"
 #include "interrupt.h"
 
 static motor_t g_motor;
@@ -110,6 +112,7 @@ static void autocal_poll(motor_t *m) {
 
 int main(void) {
     uart_init();
+    can_bus_init();
 
     // Record the reset cause (latches a watchdog fault if we hung last time)
     // before anything else touches the fault state.
@@ -121,32 +124,28 @@ int main(void) {
     // alignment) before the control ISR goes live.
     foc_init(&g_motor);
     params_init(&g_motor);
+    // CAN protocol layer: binds the motor + reads the node address from params
+    // (must follow params_init). Translates CAN frames <-> the foc setters.
+    can_proto_init(&g_motor);
     interrupt_set_active_motor(&g_motor);
 
-    // Step 1: power-up current-offset calibration (~100 ms). Exit on ERROR too
-    // so a fault during calibration cannot hang the boot before the console
-    // comes up (otherwise it is impossible to diagnose). Offsets are re-measured
-    // every boot (never persisted).
+    // Power-up current-offset calibration (~100 ms). foc_init() kicked it with
+    // NO encoder align, so the rotor stays still. Exit on ERROR too so a fault
+    // during calibration cannot hang the boot before the console comes up
+    // (otherwise it is impossible to diagnose). Offsets are re-measured every
+    // boot (never persisted).
     while (foc_get_state(&g_motor) != FOC_STATE_IDLE &&
            foc_get_state(&g_motor) != FOC_STATE_ERROR) {}
 
-    // Step 2: encoder alignment + direction auto-detect (~1200 ms), only if the
-    // offset calibration succeeded AND there is no stored alignment yet. With a
-    // persisted calibration the rotor no longer twitches on every boot.
-    if (foc_get_state(&g_motor) == FOC_STATE_IDLE &&
-        params_get()->cali_valid == 0u) {
-        foc_start_calibration(&g_motor, 1);
-        while (foc_get_state(&g_motor) != FOC_STATE_IDLE &&
-               foc_get_state(&g_motor) != FOC_STATE_ERROR) {}
-        // Persist the fresh alignment (deferred flush happens in the loop below
-        // once we are settled in IDLE).
-        if (foc_get_state(&g_motor) == FOC_STATE_IDLE) {
-            params_capture_calibration(&g_motor);
-        }
-    }
+    // Encoder zero-alignment is intentionally NOT run automatically on boot:
+    // it twitches the rotor. After a flash erase (cali_valid == 0) the stored
+    // alignment is gone and closed-loop modes will not behave until the user
+    // manually triggers calibration with the `autocal` shell command. This
+    // avoids an unexpected jolt on every fresh power-up (the align stage of
+    // autocal persists the result via the CALI->IDLE edge in the loop below).
 
-    // Calibration done — start the watchdog now (it would have tripped during
-    // the >1 s blocking calibration above).
+    // Offset calibration done — start the watchdog now (it would have tripped
+    // during the blocking current-offset calibration above).
     fault_watchdog_start();
 
     // Calibration leaves the motor in IDLE (or ERROR on failure). From here the
@@ -178,6 +177,16 @@ int main(void) {
         // Persist the mechanical parameters when a J/B/Tc run finishes.
         if (prev_state == FOC_STATE_IMECH && cur_state == FOC_STATE_IDLE) {
             params_capture_identmech(&g_motor);
+        }
+        // Finalise + persist the anti-cogging map when a calibration sweep
+        // finishes (heavy DC-removal/quantise math, kept out of the ISR). Only
+        // on a NATURAL completion (phase == ACOG_DONE); a `stop` abort leaves the
+        // phase mid-sweep, so the partial accumulation is discarded, not saved.
+        if (prev_state == FOC_STATE_ACOG && cur_state == FOC_STATE_IDLE &&
+            g_motor.acog.phase == ACOG_DONE) {
+            if (foc_acog_finish(&g_motor)) {
+                params_capture_acog(&g_motor);
+            }
         }
         prev_state = cur_state;
 
@@ -212,9 +221,17 @@ int main(void) {
         // Serve shell commands (or stream VOFA frames in scope mode).
         shell_port_poll();
 
+        // Service the CAN protocol layer: dispatch received commands, run the
+        // command watchdog, emit periodic telemetry. Runs at the 1 ms tick.
+        can_proto_poll();
+
         fault_watchdog_feed();
 
-        if (foc_get_state(&g_motor) != FOC_STATE_ERROR) {
+        // Re-assert the held position target each ms so POSITION mode holds,
+        // but NOT during the anti-cogging creep — there foc_acog_run owns
+        // ctrl.pos.target_pos and this would fight it.
+        foc_state_t pos_st = foc_get_state(&g_motor);
+        if (pos_st != FOC_STATE_ERROR && pos_st != FOC_STATE_ACOG) {
             foc_set_target_position(&g_motor, g_motor.target.pos);
         }
     }

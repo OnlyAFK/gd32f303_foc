@@ -19,6 +19,241 @@ Entry template:
 
 ---
 
+## CAN hardening: bus-off auto-recovery + hardware node filter — 2026-07-29
+### What
+- **Bus-off auto-recovery ON** (`CAN_AUTO_BUS_OFF_RECOVERY 1` in `bsp/can.c`):
+  after a bus-off the controller rejoins the bus by itself (hardware ABOM
+  sequence, 128 x 11 recessive bits) instead of staying off-bus until reboot.
+- **New `can_bus_set_node_filter(node_id)` in `bsp/can`** — programs two
+  32-bit mask filters: this node (`ID = node<<5 | cmd`, cmd bits don't-care)
+  and the broadcast node 0, standard frames only. Replaces the accept-all
+  filter installed by `can_bus_init`.
+- **`can_proto` applies it**: in `can_proto_init`, and re-applies live in
+  `can_proto_poll` when `set can_id N` changes the address — re-addressing a
+  node no longer needs a reboot.
+- **Pre-commit review fixes**: `CAN_NODE_BCAST` was 1 (dropped every node-0
+  broadcast frame in software after the hardware filter had accepted it) — now
+  0, so broadcast commands actually reach the dispatcher. An unknown SET_MODE
+  byte no longer arms the command watchdog against motion it did not start.
+- Version bumped 0.2.6 → 0.2.7 (PATCH: logic changed, stored params kept).
+### Why
+- The two follow-ups from the protocol-layer entry: a bus-off previously
+  stranded the node until re-init, and the accept-all filter would burn
+  CPU/ring slots on every foreign frame once on a busy multi-node bus.
+### How to use
+- Nothing to do — both are automatic. Verify on the bench: `canproto` commands
+  work as before; frames addressed to other node IDs no longer show up in
+  `canstat`; shorting/bus-loading the bus into bus-off now recovers on its own
+  (watch TEC/REC in `canstat` return to 0).
+### Notes / follow-ups
+- Trade-off: `canstat` can no longer sniff the whole bus (foreign frames are
+  dropped in hardware now). To sniff, comment out the
+  `can_bus_set_node_filter` call in `can_proto_init` (the BSP init stays
+  accept-all) and rebuild.
+- MIT impedance control (0x10) remains reserved/unimplemented.
+- Also recorded here: `SHELL_BUFFER_SIZE` raised 128 -> 512 in
+  `app/shell_port.c` — letter-shell splits the buffer across the edit line plus
+  5 history slots (`shell.c: bufferSize = size / (HISTORY+1)`), so 128 left only
+  ~20 usable chars per command (too short for e.g. `cansend 23 10 27 00 00`);
+  512 gives ~84.
+
+---
+
+## CAN protocol layer: command + telemetry over CAN — 2026-07-28
+### What
+- **New `app/can_proto.{c,h}` — CAN application protocol.** Sits on top of the
+  `bsp/can` frame transport and translates CAN frames <-> the FOC control API.
+  Owns no control logic: command frames call the same `foc_set_*` setters the
+  letter-shell uses, so CAN and the console are peer front-ends onto one motor.
+  Serviced from the 1 ms main loop via `can_proto_poll()`.
+- **Addressing (ODrive-style split of the 11-bit standard ID):**
+  `ID = (node_id << 5) | cmd_id`, node_id 1..63 (0 = broadcast), cmd_id 0..31.
+  The node address is the new `can_id` parameter, so a board is re-addressable
+  without a recompile. Node filtering is done in software (the hardware filter
+  stays accept-all so `canstat` can still watch the whole bus for debugging).
+- **Command frames (host -> board):** 0x01 SET_MODE (b0 = mode enum), 0x02
+  SET_CURRENT (int16 iq_mA, int16 id_mA), 0x03 SET_SPEED (int32 rpm*100), 0x04
+  SET_POSITION (int32 rad*10000), 0x05 ESTOP, 0x06 CLEAR_FAULT, 0x08 SET_TELEM
+  (b0 = 0/1). All little-endian, fixed-point so a CAN analyzer can drive it by
+  hand. 0x10 MIT_CONTROL is reserved (impedance control) — NACKed for now, ID
+  kept so the map is stable when it lands.
+- **Telemetry frames (board -> host):** off by default (quiet bus for debug);
+  enable with SET_TELEM. Two frames interleaved at 50 Hz each (one every 10 ms):
+  0x00 HEARTBEAT (state, active-fault u32, flags) and 0x07 FEEDBACK (int16 rpm,
+  iq_mA, pos*100, vbus*10).
+- **Command watchdog:** `can_wdog_ms` parameter; if >0 and the host goes silent
+  for that long while driving, the motor auto-stops to IDLE. **Default 0 (off)**
+  — current use is bench debug with hand-sent frames, where a timeout would keep
+  stopping the motor. Turn on for autonomous host control.
+- **New params** `can_id` (default 1) and `can_wdog` (default 0), stored in the
+  KVDB like every other parameter (added `PT_U16` to the field-table type set for
+  the 16-bit watchdog). Set live with `set can_id N` / `set can_wdog <ms>`.
+- **New shell command `canproto`** shows node id, telemetry/watchdog state, and
+  rx/tx counters. `cansend`/`canstat` are kept for low-level bus debugging.
+### Why
+- The CAN BSP (2026-07-23) opened the transport but carried no semantics. This
+  is the "command/monitor the drive over CAN" layer that was deferred then.
+### How to use
+- Node 1 (default) IDs = 0x20 | cmd_id: SET_MODE 0x21, SET_CURRENT 0x22,
+  SET_SPEED 0x23, SET_POSITION 0x24, ESTOP 0x25, CLEAR_FAULT 0x26,
+  SET_TELEM 0x28; board sends HEARTBEAT 0x20, FEEDBACK 0x27.
+- Spin at 100 rpm from a CAN analyzer. **Mode first, then setpoint** — entering
+  a mode zeros that mode's target (anti-lurch), so a setpoint sent before the
+  mode is wiped:
+  1. `cansend 21 02` — SET_MODE to speed (mode enum 2).
+  2. `cansend 23 10 27 00 00` — SET_SPEED, int32 = 10000 (100 rpm * 100 = 0x2710 LE).
+  3. `cansend 25` — ESTOP back to IDLE.
+- Push +1.0 A iq: `cansend 21 01` (current mode) first, then `cansend 22 E8 03 00 00`
+  (iq = 1000 mA = 0x03E8 LE, id = 0).
+- Telemetry: `cansend 28 01` to start; heartbeat (0x20) and feedback (0x27)
+  then appear every 10 ms on the analyzer or in `canstat`. `cansend 28 00` stops.
+- `canproto` prints the live protocol state; `set can_id 2` moves the node
+  (auto-saves in IDLE); `set can_wdog 100` arms the 100 ms command watchdog.
+### Notes / follow-ups
+- Hardware RX filter still accept-all; tighten to node+broadcast once on a busy
+  multi-node bus. Bus-off auto-recovery still off in the BSP.
+- MIT impedance control (0x10) reserved but not implemented — it needs a torque
+  synthesis path (pos+vel+Kp/Kd+τff -> iq) in the FOC core, deferred.
+- Version bumped 0.2.5 → 0.2.6 (PATCH: two params added, stored params kept).
+
+---
+
+## CAN BSP: CAN0 frame transport (PA11/PA12, 1 Mbps) — 2026-07-23
+### What
+- **New `bsp/can.{c,h}` — CAN0 frame transport.** GPIO PA11=RX / PA12=TX
+  (default mapping, per `doc/GD32F303CCT6_pinmap.xlsx` sheet1; the sheet2
+  "PB8/PB9 remap" line is only a remark about the alternative and was NOT
+  used — PB8 is the WS2812B LED). Bit timing from APB1 60 MHz: prescaler 4,
+  BS1 11 tq, BS2 3 tq (15 tq/bit, 80% sample point) → 1 Mbps; compile-time
+  macros, with the 500 kbps alternative noted next to them.
+- **Frame API** (`can_bus_*`, because the GD32 SPL owns the `can_*` prefix):
+  `can_bus_init/send/recv/get_stats`. RX is interrupt-driven (FIFO0 → 16-frame
+  lock-free SPSC ring, drops counted when full); TX queues into a hardware
+  mailbox and returns 0 when all are busy. Accept-all filter for now. CAN is a
+  frame device — deliberately NOT an `io_stream` backend.
+- **Debug shell hooks** `cansend <id_hex> [b0..b7]` and `canstat` (TEC/REC,
+  rx_dropped, drains and prints received frames). Bring-up only; the real
+  protocol layer will replace them.
+- `CAN_SELFTEST_LOOPBACK` switch in `bsp/can.c` selects the internal loopback
+  mode so the TX→RX path can be bench-tested with no transceiver attached.
+### Why
+- First step toward commanding/monitoring the drive over CAN. Scope was
+  deliberately limited to the BSP; the application protocol is a separate
+  follow-up.
+### How to use
+- No transceiver: set `CAN_SELFTEST_LOOPBACK 1`, flash, then
+  `cansend 123 11 22 33` → `canstat` shows the same frame received.
+- On a real bus (1 Mbps, transceiver required): `cansend 1AB DE AD BE EF`
+  should appear on a CAN analyzer; frames sent to the board show up in
+  `canstat`. With no bus/ACK, `cansend` starts returning "no free mailbox"
+  after 3 frames and TEC climbs — that is the hardware reporting no ACK.
+### Notes / follow-ups
+- Bus-off auto-recovery is OFF (`CAN_AUTO_BUS_OFF_RECOVERY 0`): after a
+  bus-off the node stays off-bus until re-init. Recovery policy and comm-loss
+  protection were explicitly deferred to the protocol phase.
+- Also recorded here: `bsp/uart.c` is now **115200 baud with 4 KB ring
+  buffers** (was 3 Mbaud / 1 KB) — the "3 Mbaud VT100 terminal" note in the
+  2026-06-04 entry is superseded.
+- Version bumped 0.2.4 → 0.2.5 (PATCH: feature added, stored params kept;
+  also covers the anti-cogging KV key which missed its bump).
+
+## Drop automatic encoder alignment on boot — 2026-06-12
+### What
+- **Removed the power-up encoder zero-alignment step from `main()`** (the
+  `foc_start_calibration(&g_motor, 1)` that ran whenever `cali_valid == 0`).
+- The power-up **current-offset** calibration (`foc_init` → `foc_start_calibration(_, 0)`,
+  no rotor motion) is unchanged and still runs every boot.
+### Why
+- After a flash erase + reflash, `cali_valid` is 0, so the old code auto-ran the
+  alignment on first power-up — twitching the rotor on every fresh flash, an
+  unexpected jolt and a small risk. Aligning is now a deliberate user action.
+### How to use
+- After erasing/reflashing, run `autocal` from the shell once to align the encoder
+  (+ identify Rs/Ld/Lq/flux/J/B and deploy gains); the alignment is persisted via
+  the CALI→IDLE edge, so subsequent boots need no re-alignment. Until then,
+  closed-loop modes use the compile-time default `zero_offset` and may not run
+  correctly — by design.
+
+## Extract parameter identification into foc_ident — 2026-06-12
+### What
+- **Moved the electrical (`FOC_STATE_IDENT`) and mechanical (`FOC_STATE_IMECH`)
+  identification sub-state-machines out of `foc_core.c/.h` into `foc/foc_ident.c/.h`**
+  and wired `foc_ident.c` into the MDK build (`f303_foc.uvprojx`).
+- `foc_core.h` now `#include`s `foc_ident.h` for `ident_ctx_t` / `imech_ctx_t`
+  (composed into `motor_t`); the duplicate type/enum/`#define` blocks and the
+  `foc_start_ident*` declarations were removed from `foc_core.h`.
+- `foc_control_loop` now calls the extracted hooks `foc_ident_run()` /
+  `foc_imech_run()` in the IDENT/IMECH switch cases, and the locked-rotor angle
+  override uses the public `foc_ident_locks_rotor()` instead of an inline phase test.
+### Why
+- A prior restore left **two copies** of the ident code: the live one inlined in
+  `foc_core`, plus an orphaned (unbuilt, un-included) `foc_ident.c/.h`. Adding
+  `foc_ident.c` to the build as-is would have caused duplicate `foc_start_ident*`
+  symbols and, in any TU including both headers, duplicate `ident_ctx_t` etc.
+  This finishes the split so identification lives in one module, mirroring `foc_acog`.
+### Notes / follow-ups
+- Pure refactor — verified function-by-function that the moved logic is byte-identical
+  to the old `foc_core` version (only comments referencing the new function names
+  differ). No control behaviour change. Dropped the unused `ident_is_rs_phase` helper.
+
+## Anti-cogging map (step-and-settle calibration) — 2026-06-09
+### What
+- **New `FOC_STATE_ACOG` calibration that learns a per-mechanical-angle
+  feed-forward torque-current map** (`foc/foc_acog.c/.h`, 1024-bin int8 table).
+  At run time the map is added to the iq command in CURRENT/SPEED/POSITION modes
+  to cancel cogging (`foc_acog_lookup`, two loads + a lerp in the 20 kHz ISR).
+- **The sweep REUSES the position→speed→current cascade**, it does NOT use a
+  position→current spring. It steps the position controller one bin at a time,
+  lets the rotor **settle to rest**, then measures; the speed-loop **integral**
+  holds each angle and `max_rpm` caps the hop speed (smooth, no noise
+  amplification). One bin per step → the cascade always reaches it in a short
+  fixed dwell, so **no per-point arrival check** (the gate that made the old
+  spring take an hour). 2·1024 steps is a deterministic ~3.5 min.
+- **Why measure at rest (DC), not while moving**: this motor has 168 cogging
+  cycles/rev, so even a slow continuous creep puts the cogging frequency far
+  above the soft speed-loop bandwidth — the loop can't track it and the measured
+  iq comes out attenuated + phase-lagged (a weak, misaligned map that doesn't
+  cancel cogging; the first continuous-creep cut measured only ~0.25 A peak and
+  did not smooth low-speed running). At rest the holding torque is DC where the
+  integrator has full authority, so iq == the true cogging torque at that angle.
+- **Measurement**: the held iq is averaged over a 10 ms window after a 40 ms
+  settle and accumulated into the rest-angle bin; forward+reverse over the same
+  bins cancel static friction. Finalise removes the DC component (cogging is
+  zero-mean; the offset is friction that must not be fed forward), clamps `max_ff`.
+- **Persistence**: stored as a ~1 KB int8+scale blob KV (`"cogging"`) in the
+  existing FlashDB KVDB, loaded on boot (`params_capture_acog` /
+  `load_acog_from_flash`). Auto-saved on a successful sweep; `acog on/off`
+  persists the enable flag; `acog clear` deletes it.
+- **New shell command** `acog <cal [rpm]|on|off|clear|info>`. `foc_acog.c` added
+  to the Keil project (`MDK-ARM/f303_foc.uvprojx`).
+### Why
+- The previous attempt drove calibration with a stiff position→current spring,
+  which (no integrator) could not both hold a precise angle and break a cogging
+  detent: it stick-slipped, oscillated when stiffened, and the per-point arrival
+  gate made a sweep take an hour. The reference firmware (`Firmware_app`) creeps
+  smoothly because it keeps the integrator-backed speed loop in the loop and
+  velocity-limits the motion — this change adopts that approach on top of this
+  project's existing cascade.
+### How to use
+- Prerequisites: encoder aligned + current offsets valid (`autocal` once). Then:
+  `acog cal` (optionally `acog cal <rpm>` to override the ~10 rpm inter-bin hop
+  cap; it only sets hop speed, not accuracy — measurement is at rest). Keep the
+  rotor clear; watch `status` (state ACOG → IDLE, ~3.5 min). On success the map
+  auto-enables and saves (~3.5 min); `acog info` shows `valid/enabled/peak_A`.
+  Verify with `acog off` vs `acog on` at a low `speed`.
+- Tuning with no scope: if the rotor can't reach/hold a bin, raise the speed
+  integral (`set spd_ki …`); raising the hop cap just speeds the sweep. Do **not**
+  raise the position landing gain for stiffness.
+### Notes / follow-ups
+- Calibration statics add ~7 KB SRAM (map 4 KB + counts 2 KB + blob ~1 KB); the
+  counts are cal-only. Watch the linker map if SRAM gets tight.
+- `motor_t` is now the tagged `struct motor_s` (guarded forward-decl) so
+  `foc_acog.h` can compose `acog_ctx_t` into it the same way the orphan
+  `foc_ident.h` intended; no behavioural change to existing code.
+- A `stop` mid-sweep discards the partial map (only `ACOG_DONE` finalises), but
+  the in-RAM map was already cleared at sweep start — reboot restores the stored
+  copy.
+
 ## One-shot `autocal` + command/cleanup pass — 2026-06-06
 ### What
 - **New `autocal` command runs the entire commissioning sequence end-to-end**:

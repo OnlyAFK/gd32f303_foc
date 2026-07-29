@@ -8,7 +8,7 @@ extern "C" {
 #include <stdint.h>
 #include "io_stream.h"
 
-// USART2 on PB10 (TX) / PB11 (RX), 3 Mbaud, DMA-driven with lwrb ring buffers.
+// USART2 on PB10 (TX) / PB11 (RX), DMA-driven with lwrb ring buffers.
 // TX: application data is queued in a ring buffer and drained by DMA0_CH1.
 // RX: DMA0_CH2 fills a circular buffer; IDLE + DMA half/full events push the
 //     received bytes into an RX ring buffer that the application reads from.
