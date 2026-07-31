@@ -24,6 +24,9 @@ static motor_t g_motor;
 #define AUTOCAL_IMECH_IQ    1.0f     /* J/B test current */
 #define AUTOCAL_CUR_BW_HZ   1000.0f  /* current-loop bandwidth */
 #define AUTOCAL_SPD_BW_HZ   10.0f    /* speed-loop bandwidth */
+#define AUTOCAL_LTU_CURRENT 3.0f     /* LTU open-loop drag current (sizes the
+                                        drag voltage from the identified Rs) */
+#define AUTOCAL_LTU_VOLTS   2.0f     /* drag voltage fallback if Rs unknown */
 
 typedef enum {
   AC_OFF = 0,
@@ -32,6 +35,8 @@ typedef enum {
   AC_ALIGN_SETTLE,
   AC_IDENT_WAIT,
   AC_IDENT_SETTLE,
+  AC_LTU_WAIT,
+  AC_LTU_SETTLE,
   AC_IMECH_WAIT,
   AC_DONE,
 } ac_phase_t;
@@ -87,6 +92,28 @@ static void autocal_poll(motor_t *m) {
     break;
 
   case AC_IDENT_SETTLE:
+    if (s_ac_delay == 0u) {
+      /* Encoder linearization: one open-loop rev each way (~56 s). Size the
+       * drag voltage from the just-identified Rs (V = I*R*3/2, same sizing as
+       * the reference firmware) so the drag current sits near 3 A. */
+      float rs = params_get()->rs;
+      float v = (rs > 0.0f) ? AUTOCAL_LTU_CURRENT * rs * 1.5f : AUTOCAL_LTU_VOLTS;
+      foc_start_ltu(m, v);
+      s_ac_phase = AC_LTU_WAIT;
+    } else {
+      s_ac_delay--;
+    }
+    break;
+
+  case AC_LTU_WAIT:
+    if (st == FOC_STATE_IDLE) {
+      if (!foc_ltu_is_valid(m)) { s_ac_phase = AC_OFF; break; }  /* sweep failed */
+      s_ac_delay = AUTOCAL_SETTLE_MS;
+      s_ac_phase = AC_LTU_SETTLE;
+    }
+    break;
+
+  case AC_LTU_SETTLE:
     if (s_ac_delay == 0u) {
       float kt = 1.5f * (float)HW_MOTOR_POLE_PAIRS * (params_get()->flux * 1.0e-3f);
       foc_start_identmech(m, kt, AUTOCAL_IMECH_IQ);    /* mechanical: J/B/Tc */
@@ -186,6 +213,15 @@ int main(void) {
             g_motor.acog.phase == ACOG_DONE) {
             if (foc_acog_finish(&g_motor)) {
                 params_capture_acog(&g_motor);
+            }
+        }
+        // Finalise + persist the encoder linearization table when a sweep
+        // finishes (FIR/decimate math, kept out of the ISR). Same natural-
+        // completion rule as acog: an aborted sweep is discarded.
+        if (prev_state == FOC_STATE_LTU && cur_state == FOC_STATE_IDLE &&
+            g_motor.ltu.phase == LTU_DONE) {
+            if (foc_ltu_finish(&g_motor)) {
+                params_capture_ltu(&g_motor);
             }
         }
         prev_state = cur_state;

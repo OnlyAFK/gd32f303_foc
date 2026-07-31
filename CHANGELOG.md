@@ -19,6 +19,64 @@ Entry template:
 
 ---
 
+## Encoder linearization (LTU) + autocal stage — 2026-07-31
+### What
+- **New module `foc/foc_ltu`**: encoder linearization via a 128-entry lookup
+  table (one entry per 256 raw counts of the 15-bit TLE5012B), cancelling the
+  sensor's residual per-rev non-linearity (magnet eccentricity / INL).
+  Calibration is a new `FOC_STATE_LTU` sub-state machine ported from the dgm
+  reference firmware: the rotor is dragged open-loop (fixed voltage vector,
+  electrical angle sweeping at pi rad/s) one full mechanical rev CW then one
+  rev CCW over the same 128*pp sample points; the two passes are averaged
+  (cancels the open-loop drag angle), an FIR one electrical period wide
+  smooths noise, and the result is decimated/rotated into the table. The
+  global mean is discarded — the LUT is zero-mean, the alignment `zero_offset`
+  keeps its own meaning. A ~0.5 s drag-voltage ramp at theta=0 precedes the
+  sweep so the rotor eases onto the start angle.
+- **Run-time correction**: `foc_encoder_callback` passes
+  `foc_ltu_correction()` (two table reads + one integer lerp, ~6 ops) into
+  `motor_hw_process_encoder_data()`, which subtracts it from the raw count
+  before the direction/zero-offset pipeline. Both the build and the lookup
+  work in the direction-normalised count domain (`raw_n = dir<0 ? CPR-raw :
+  raw`), so a direction flip from a later re-alignment cannot silently reverse
+  the table; the raw-domain correction is `dir * off`. The correction
+  self-bypasses while in `FOC_STATE_LTU` so an old table never contaminates a
+  new sweep, and `raw_angle` still holds the true (uncorrected) sensor count.
+- **autocal integration**: new `AC_LTU_*` stage between IDENT and IMECH
+  (`app/main.c`); the drag voltage is sized from the just-identified Rs
+  (V = 3 A * Rs * 1.5, fallback 2 V). autocal now takes ~100 s. A failed
+  sweep (stall detected via a full-scale error spread check in
+  `foc_ltu_finish`) aborts the sequence.
+- **Persistence**: new FlashDB blob KV `"ltu"` (~262 B: valid/enabled/peak +
+  int16 table), same three-function seam as the anti-cogging map
+  (`foc_ltu_blob` / `_load_buffer` / `_load_commit`); captured on the natural
+  LTU->IDLE completion edge, loaded in `params_init`.
+- **New shell command `ltu`**: `ltu cal [volts]` (standalone sweep, needs a
+  prior alignment), `ltu on|off` (persisted in IDLE), `ltu clear`, `ltu info`
+  (peak error in counts + millidegrees). `status` shows the LTU state.
+- Version bumped 0.2.8 -> 0.2.9 (PATCH: new KV added, stored params kept).
+### Why
+- The TLE5012B's residual non-linearity (typically a few tenths of a degree
+  mechanical, x14 electrically) shows up as torque/speed ripple at low speed
+  that no loop tuning can remove. The dgm reference firmware solves this with
+  exactly this LUT approach; this ports it into the autocal flow so it is
+  measured alongside the other commissioning steps.
+### How to use
+- `autocal` — now includes the linearization sweep automatically (~100 s
+  total; rotor turns one rev each way during the LTU stage).
+- `ltu` / `ltu info` — show table status (valid/enabled/peak error).
+- `ltu cal [volts]` — standalone re-run without the full autocal.
+- `ltu off` / `ltu on` — A/B the correction (e.g. watch speed ripple in
+  `scope` at low rpm); `ltu clear` discards the table.
+### Notes / follow-ups
+- Sweep time is 2 x 2*pi*pp / LTU_PHASE_VEL (56 s at the pi rad/s default
+  with 14 pp); `LTU_PHASE_VEL` in `foc_ltu.c` is the one knob if a faster but
+  less clean sweep is ever needed.
+- Calibration SRAM cost is a 7 KB static int32 sample buffer in `foc_ltu.c`
+  (128 samples/electrical-rev x 14 pole pairs).
+
+---
+
 ## Encoder path: config verify + race removal + lag compensation — 2026-07-30
 ### What
 - **SSC clock 3.75 -> 7.5 MHz** (`SPI_PSC_16` -> `SPI_PSC_8` in

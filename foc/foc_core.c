@@ -292,6 +292,11 @@ void foc_init(motor_t *motor) {
   motor->acog.enabled = 0u;
   motor->acog.peak = 0.0f;
 
+  /* Encoder linearization table likewise; params_init() loads a stored one. */
+  motor->ltu.valid = 0u;
+  motor->ltu.enabled = 0u;
+  motor->ltu.peak = 0;
+
   motor->xform.svpwm.ts = motor->pwm_period;
   motor->xform.svpwm.udc = motor->vdc;
 
@@ -420,6 +425,21 @@ void foc_set_state(motor_t *motor, foc_state_t state) {
     motor_hw_enable_driver();
     break;
 
+  case FOC_STATE_LTU:
+    /* Encoder linearization sweeps the rotor with an open-loop voltage vector.
+     * It bypasses the current loops but still needs valid offsets so the
+     * current-based protections read real currents while the rotor moves. */
+    if (!motor->sensor.cur_offset.is_calibrated) {
+      state = FOC_STATE_ERROR;
+      motor_hw_disable_driver();
+      motor_hw_set_pwm_brake();
+      break;
+    }
+    pid_reset(&motor->ctrl.id);
+    pid_reset(&motor->ctrl.iq);
+    motor_hw_enable_driver();
+    break;
+
   case FOC_STATE_IDLE:
     motor_hw_disable_driver();
     motor_hw_set_pwm_brake();
@@ -518,7 +538,10 @@ void foc_set_limit(motor_t *motor, foc_limit_sel_t sel, float lim) {
 }
 
 void foc_encoder_callback(motor_t *motor) {
-  motor_hw_process_encoder_data(&motor->sensor.encoder);
+  /* Subtract the linearization correction (0 unless the LTU table is valid +
+   * enabled) from the raw count before the direction/offset pipeline runs. */
+  motor_hw_process_encoder_data(&motor->sensor.encoder,
+                                foc_ltu_correction(motor));
 }
 void foc_control_loop(motor_t *motor) {
   motor_hw_debug_pin(1);
@@ -576,6 +599,10 @@ void foc_control_loop(motor_t *motor) {
     ctrl_theta = CALI_DIR_THETA;   /* shifted angle for direction detection */
   } else if (foc_ident_locks_rotor(motor)) {
     ctrl_theta = 0.0f;             /* lock rotor to phase A for Rs / Ld / Lq */
+  } else if (motor->state == FOC_STATE_LTU) {
+    /* Open-loop drag: the voltage vector follows the sweep's commanded angle
+     * (unbounded during the rev; wrapped here for the transform). */
+    ctrl_theta = normalize_angle(motor->ltu.theta);
   } else {
     /* First-order extrapolation to cancel the sensor + pipeline lag
      * (ENCODER_LAG_S): the raw angle describes where the rotor was ~100 us
@@ -667,6 +694,11 @@ void foc_control_loop(motor_t *motor) {
   case FOC_STATE_IMECH:
     /* Mechanical ident sub-state machine (see foc_ident.c). */
     foc_imech_run(motor, &vd_out, &vq_out);
+    break;
+
+  case FOC_STATE_LTU:
+    /* Encoder linearization sub-state machine (see foc_ltu.c). */
+    foc_ltu_run(motor, &vd_out, &vq_out);
     break;
 
   case FOC_STATE_IDLE:

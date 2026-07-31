@@ -28,6 +28,7 @@ libraries/  vendor code (CMSIS, GD32 SPL, lwrb, CMSIS-DSP, letter-shell, flashdb
 | `pid`, `pll`, `svpwm`, `filter`, `foc_math` | foc | Pure leaf math; depend only on `foc_math`/CMSIS-DSP |
 | `motor_hw` | foc | **HAL** — the *only* module that includes `driver/*` and bsp chip headers |
 | `foc_core` | foc | FOC state machine, cascaded loops |
+| `foc_ident`, `foc_acog`, `foc_ltu` | foc | Commissioning sub-state machines (param ident, anti-cogging, encoder linearization); per-tick hooks from `foc_core`, big buffers as module-private statics, blob persistence via `params` |
 | `fault` | foc | Protection + error handling; consumes `motor_hw` only. Tunable thresholds live in `fault_cfg_t` (`fault_set_cfg`/`_get_cfg`), guarded/clamped to `*_HARD_*` limits |
 | `interrupt` | foc | ISR entry points / control-loop scheduling |
 | `vofa` | foc* | Telemetry formatting (see Known debts) |
@@ -79,11 +80,12 @@ Any non-empty result from 2–4 is a layering leak to fix.
 
 ## Known debts
 
-- **`foc_core.c` (~690 lines)**: hosts the cascaded control loops. The
+- **`foc_core.c` (~700 lines)**: hosts the cascaded control loops. The
   parameter-identification sub-state-machines (Rs/Ld/Lq/flux electrical +
-  J/B/Tc mechanical) have been split into `foc/foc_ident`, and the anti-cogging
-  sweep into `foc/foc_acog`; `foc_core` calls their per-tick hooks from the
-  control ISR. No longer a split candidate on its own.
+  J/B/Tc mechanical) have been split into `foc/foc_ident`, the anti-cogging
+  sweep into `foc/foc_acog`, and encoder linearization into `foc/foc_ltu`;
+  `foc_core` calls their per-tick hooks from the control ISR. No longer a
+  split candidate on its own.
 - **Telemetry coupling**: `vofa` lives in `foc/` and `foc_core` *pushes* to it
   each control cycle (control → telemetry inversion). Invert to a registered
   callback / pull model and move to a service dir when telemetry is reworked.

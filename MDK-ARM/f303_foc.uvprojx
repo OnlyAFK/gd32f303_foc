@@ -619,6 +619,11 @@
               <FilePath>..\foc\foc_ident.c</FilePath>
             </File>
             <File>
+              <FileName>foc_ltu.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\foc\foc_ltu.c</FilePath>
+            </File>
+            <File>
               <FileName>fault.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\foc\fault.c</FilePath>

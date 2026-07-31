@@ -126,9 +126,13 @@ static inline float normalize_angle(float angle) {
   return angle;
 }
 
-void motor_hw_process_encoder_data(encoder_data_t *encoder) {
+void motor_hw_process_encoder_data(encoder_data_t *encoder, int32_t raw_corr) {
   encoder->raw_angle = tle5012b_get_raw() & (uint16_t)(HW_ENCODER_CPR - 1u);
-  encoder->mech_angle = encoder->direction * encoder->raw_angle * RAW_TO_RAD;
+  /* raw_angle keeps the true sensor count; the linearization correction only
+   * feeds the angle conversion (subtract then wrap back into [0, CPR)). */
+  uint16_t lin_raw = (uint16_t)((int32_t)encoder->raw_angle - raw_corr) &
+                     (uint16_t)(HW_ENCODER_CPR - 1u);
+  encoder->mech_angle = encoder->direction * lin_raw * RAW_TO_RAD;
   encoder->mech_angle = normalize_angle(encoder->mech_angle);
 
   /* Electrical angle: θe = (θm - offset) * Pp  (offset from alignment) */

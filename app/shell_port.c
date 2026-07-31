@@ -109,6 +109,7 @@ static const char *state_name(foc_state_t s) {
   case FOC_STATE_IDENT:           return "IDENT";
   case FOC_STATE_IMECH:           return "IMECH";
   case FOC_STATE_ACOG:            return "ACOG";
+  case FOC_STATE_LTU:             return "LTU";
   case FOC_STATE_ERROR:           return "ERROR";
   default:                        return "?";
   }
@@ -202,8 +203,8 @@ static int cmd_autocal(int argc, char *argv[]) {
     return 0;
   }
   autocal_start();
-  shellWriteString(&s_shell, "auto-calibration started (~45 s):\r\n");
-  shellWriteString(&s_shell, "  cal+align -> Rs/Ld/Lq/flux -> J/B/Tc, gains auto-deployed\r\n");
+  shellWriteString(&s_shell, "auto-calibration started (~100 s):\r\n");
+  shellWriteString(&s_shell, "  cal+align -> Rs/Ld/Lq/flux -> enc linearization -> J/B/Tc, gains auto-deployed\r\n");
   shellWriteString(&s_shell, "  rotor MOVES then SPINS - keep clear! watch 'status'\r\n");
   return 0;
 }
@@ -345,6 +346,75 @@ static int cmd_acog(int argc, char *argv[]) {
     acog_print_info();
   } else {
     shellWriteString(&s_shell, "usage: acog <cal [rpm]|on|off|clear|info>\r\n");
+  }
+  return 0;
+}
+
+// Encoder linearization (LTU) table: calibrate / enable / disable / clear / info.
+//   ltu cal [volts]  start the open-loop calibration sweep (1 rev each way; ~56 s)
+//   ltu on|off       enable/disable the run-time correction (persisted in IDLE)
+//   ltu clear        discard the table (deletes the stored copy)
+//   ltu              show table status
+static void ltu_print_info(void) {
+  shellPrint(&s_shell, "ltu: valid=%d enabled=%d\r\n",
+             (int)foc_ltu_is_valid(s_motor), (int)foc_ltu_is_enabled(s_motor));
+  int16_t peak = foc_ltu_peak(s_motor);
+  shellPrint(&s_shell, "  peak = %d counts\r\n", (int)peak);
+  print_f("  peak_mdeg", (float)peak * (360.0f * 1000.0f / 32768.0f));
+}
+
+static int cmd_ltu(int argc, char *argv[]) {
+  if (argc < 2) {
+    ltu_print_info();
+    shellWriteString(&s_shell, "usage: ltu <cal [volts]|on|off|clear|info>\r\n");
+    return 0;
+  }
+  const char *sub = argv[1];
+
+  if (strcmp(sub, "cal") == 0) {
+    if (foc_get_state(s_motor) != FOC_STATE_IDLE) {
+      shellWriteString(&s_shell, "need IDLE first (use 'stop')\r\n");
+      return 0;
+    }
+    if (!params_get()->cali_valid) {
+      shellWriteString(&s_shell, "encoder not aligned; run 'autocal' first\r\n");
+      return 0;
+    }
+    if (!s_motor->sensor.cur_offset.is_calibrated) {
+      shellWriteString(&s_shell, "current offsets not calibrated\r\n");
+      return 0;
+    }
+    float volts;
+    if (argc >= 3) {
+      volts = arg_f(argv[2]);
+    } else {
+      /* Size the drag voltage from the identified Rs (V = 3A * Rs * 1.5),
+       * falling back to the module default when Rs is unknown. */
+      float rs = params_get()->rs;
+      volts = (rs > 0.0f) ? 3.0f * rs * 1.5f : 0.0f;
+    }
+    foc_start_ltu(s_motor, volts);
+    shellWriteString(&s_shell, "encoder linearization cal started (~56 s):\r\n");
+    shellWriteString(&s_shell, "  rotor TURNS one rev each way - keep clear! watch 'status'\r\n");
+  } else if (strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
+    uint8_t on = (sub[1] == 'n');                      /* "on" vs "off" */
+    foc_ltu_set_enable(s_motor, on);
+    if (foc_get_state(s_motor) == FOC_STATE_IDLE) {
+      params_capture_ltu(s_motor);                     /* persist the enable flag */
+      shellPrint(&s_shell, "ltu %s (saved)\r\n", on ? "on" : "off");
+    } else {
+      shellPrint(&s_shell, "ltu %s (live; stop to persist)\r\n", on ? "on" : "off");
+    }
+  } else if (strcmp(sub, "clear") == 0) {
+    foc_ltu_clear(s_motor);
+    if (foc_get_state(s_motor) == FOC_STATE_IDLE) {
+      params_capture_ltu(s_motor);                     /* invalid table -> deletes KV */
+    }
+    shellWriteString(&s_shell, "ltu table cleared\r\n");
+  } else if (strcmp(sub, "info") == 0) {
+    ltu_print_info();
+  } else {
+    shellWriteString(&s_shell, "usage: ltu <cal [volts]|on|off|clear|info>\r\n");
   }
   return 0;
 }
@@ -733,6 +803,7 @@ const ShellCommand shellCommandList[] = {
   SHELL_CMD_ITEM(CMD_ATTR, tune, cmd_tune, re-deploy current-loop gains: tune [bw_hz]),
   SHELL_CMD_ITEM(CMD_ATTR, tunespd, cmd_tunespd, re-deploy speed-loop gains: tunespd [bw_hz]),
   SHELL_CMD_ITEM(CMD_ATTR, acog, cmd_acog, anti-cogging map: acog <cal [rpm]|on|off|clear|info>),
+  SHELL_CMD_ITEM(CMD_ATTR, ltu, cmd_ltu, encoder linearization: ltu <cal [volts]|on|off|clear|info>),
   SHELL_CMD_ITEM(CMD_ATTR, cansend, cmd_cansend, CAN debug: cansend <id_hex> [b0..b7] (hex)),
   SHELL_CMD_ITEM(CMD_ATTR, canstat, cmd_canstat, CAN debug: bus stats + drain rx frames),
   SHELL_CMD_ITEM(CMD_ATTR, canproto, cmd_canproto, CAN protocol status: node/telem/wdog/counters),

@@ -154,6 +154,7 @@ static const kv_field_t *field_find(const char *name) {
 
 static void save_fields(bool force);          /* defined below; used by params_init */
 static void load_acog_from_flash(motor_t *m); /* defined below; used by params_init */
+static void load_ltu_from_flash(motor_t *m);  /* defined below; used by params_init */
 
 /* ===================================================================
  * Stored-version guard.
@@ -276,6 +277,7 @@ void params_init(motor_t *motor) {
     struct fdb_blob blob;
     fdb_kv_get_blob(&s_kvdb, "fault_log", fdb_blob_make(&blob, &s_flog, sizeof(s_flog)));
     load_acog_from_flash(motor);   /* restore a stored anti-cogging map */
+    load_ltu_from_flash(motor);    /* restore a stored encoder linearization table */
   }
 
   params_to_motor(&s_params, motor);
@@ -388,6 +390,46 @@ static void load_acog_from_flash(motor_t *motor) {
   got = fdb_kv_get_blob(&s_kvdb, KEY_ACOG, fdb_blob_make(&blob, buf, maxlen));
   if (got > 0u) {
     foc_acog_load_commit(motor, (uint32_t)got);
+  }
+}
+
+/* Encoder linearization table blob KV — same immediate-write pattern as the
+ * anti-cogging map (the callers guarantee IDLE). The blob is owned/serialised
+ * by foc_ltu (int16 table). */
+#define KEY_LTU  "ltu"
+
+void params_capture_ltu(const motor_t *motor) {
+  struct fdb_blob blob;
+  uint32_t len = 0u;
+  const void *p;
+
+  if (!s_mounted) {
+    return;
+  }
+  p = foc_ltu_blob(motor, &len);
+  if (p != NULL && len > 0u) {
+    fdb_kv_set_blob(&s_kvdb, KEY_LTU, fdb_blob_make(&blob, (void *)p, len));
+  } else {
+    fdb_kv_del(&s_kvdb, KEY_LTU);   /* invalid table: drop any stale stored copy */
+  }
+}
+
+/* Load a stored linearization table (if any) straight into foc_ltu's live
+ * table. Internal to params_init; absent/short/invalid blob leaves the table
+ * disabled. */
+static void load_ltu_from_flash(motor_t *motor) {
+  struct fdb_blob blob;
+  uint32_t maxlen = 0u;
+  void *buf;
+  size_t got;
+
+  if (!s_mounted) {
+    return;
+  }
+  buf = foc_ltu_load_buffer(&maxlen);
+  got = fdb_kv_get_blob(&s_kvdb, KEY_LTU, fdb_blob_make(&blob, buf, maxlen));
+  if (got > 0u) {
+    foc_ltu_load_commit(motor, (uint32_t)got);
   }
 }
 

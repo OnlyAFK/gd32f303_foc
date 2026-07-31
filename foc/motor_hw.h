@@ -122,7 +122,11 @@ void motor_hw_get_currents(phase_currents_t *currents, const current_offset_t *o
 
 void motor_hw_start_encoder_read(void);
 
-void motor_hw_process_encoder_data(encoder_data_t *encoder);
+/* Convert the raw encoder word (from the DMA read kicked at the end of the
+ * previous tick) into mech/elec angle. raw_corr is the linearization (LTU)
+ * correction in counts, subtracted from the raw count before scaling; pass 0
+ * when no correction applies. */
+void motor_hw_process_encoder_data(encoder_data_t *encoder, int32_t raw_corr);
 
 void motor_hw_debug_pin(uint8_t state);
 

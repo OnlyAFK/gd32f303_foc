@@ -110,6 +110,12 @@ void params_capture_identmech(const motor_t *motor);
  * or after the `acog on/off` shell toggle so the enable flag survives a reboot. */
 void params_capture_acog(const motor_t *motor);
 
+/* Persist (or, if the table is invalid, delete) the encoder linearization
+ * table as a compact blob KV ("ltu"). Writes flash immediately, so call it
+ * only with the motor IDLE — e.g. on the LTU-done edge (LTU -> IDLE) or after
+ * the `ltu on/off` shell toggle so the enable flag survives a reboot. */
+void params_capture_ltu(const motor_t *motor);
+
 /* Compute and apply the current-loop / speed-loop PI gains from the identified
  * parameters at a closed-loop bandwidth `bw_hz`, persisting them (no-op if the
  * required parameters have not been identified). Current loop uses Rs/Ld/Lq;

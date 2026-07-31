@@ -18,6 +18,7 @@ typedef struct motor_s motor_t;
 #endif
 #include "foc_acog.h"
 #include "foc_ident.h"   /* ident_ctx_t / imech_ctx_t + the ident/imech sub-state machines */
+#include "foc_ltu.h"     /* ltu_ctx_t + the encoder-linearization sub-state machine */
 
 /* Top-level control state machine. */
 typedef enum {
@@ -31,6 +32,7 @@ typedef enum {
   FOC_STATE_IDENT,           /* electrical identification (Rs/Ld/Lq/flux) */
   FOC_STATE_IMECH,           /* mechanical identification (J/B/Tc), spins rotor */
   FOC_STATE_ACOG,            /* anti-cogging map calibration (creeps one rev each way) */
+  FOC_STATE_LTU,             /* encoder linearization calibration (open-loop sweep) */
   FOC_STATE_ERROR,           /* fault latched, outputs off */
 } foc_state_t;
 
@@ -129,6 +131,7 @@ struct motor_s {
   ident_ctx_t ident;
   imech_ctx_t imech;
   acog_ctx_t acog;
+  ltu_ctx_t ltu;
   float openloop_angle;   /* electrical angle for FOC_STATE_OPENLOOP_VOLT */
 
   float vdc;
