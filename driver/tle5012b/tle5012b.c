@@ -22,6 +22,30 @@
 #define TLE_CMD_READ_AVAL  0x8020U
 #define TLE_DUMMY          0xFFFFU
 
+// Config-space access (addresses 0x05..0x11) needs Lock = 1010B (datasheet
+// Table 4-15); data-space reads above use the default Lock = 0000B.
+#define TLE_LOCK_CFG       0x5000U
+#define TLE_ADDR_MOD1      0x06U
+#define TLE_ADDR_MOD2      0x08U
+#define TLE_CMD_READ_MOD1  (0x8000U | TLE_LOCK_CFG | (TLE_ADDR_MOD1 << 4))  // 0xD060
+#define TLE_CMD_READ_MOD2  (0x8000U | TLE_LOCK_CFG | (TLE_ADDR_MOD2 << 4))  // 0xD080
+// Writes need ND=1 (data word + safety word); with ND=0 the sensor ignores
+// the write (datasheet 4.4.1.2: ND=0 is the read-one-register shortcut).
+#define TLE_CMD_WRITE_MOD1 (TLE_LOCK_CFG | (TLE_ADDR_MOD1 << 4) | 1U)       // 0x5061
+#define TLE_CMD_WRITE_MOD2 (TLE_LOCK_CFG | (TLE_ADDR_MOD2 << 4) | 1U)       // 0x5081
+
+// MOD_1 (0x06): FIR_MD[15:14] filter update rate (TLE5012B User's Manual,
+// MOD_1 register): 00 = fastest (the E1000 fuse setting), 01 = 42.7 us,
+// 10 = 85.3 us, 11 = 170.6 us. The slow modes have bit15 set.
+#define TLE_MOD1_FIR_MD_MASK   0xC000U
+#define TLE_MOD1_FIR_MD_SLOW   0x8000U
+#define TLE_MOD1_FIR_MD_42US   0x4000U   // FIR_MD = 01 -> 42.7 us
+// MOD_2 (0x08): PREDICT[2], AUTOCAL[1:0]. Target: prediction on, autocal
+// mode 1 (1 LSB per filter update) — the E1000 fuse defaults.
+#define TLE_MOD2_PREDICT      0x0004U
+#define TLE_MOD2_AUTOCAL_MASK 0x0003U
+#define TLE_MOD2_AUTOCAL_MODE1 0x0001U
+
 #define TLE_ANGLE_MASK     0x7FFFU      // 15-bit angle field
 #define TLE_ANGLE_RES      32768.0f     // 2^15 counts per revolution
 #define TLE_2PI            6.28318530718f
@@ -42,6 +66,9 @@ static uint16_t rx_word;
 static volatile bool read_busy;
 static volatile uint16_t angle_raw;
 static volatile uint16_t dbg_cmd_echo;
+static uint16_t cfg_mod1;
+static uint16_t cfg_mod2;
+static bool cfg_ok;
 static void (*s_done_callback)(void) = 0;
 
 static void tle_delay_us(uint32_t us) {
@@ -81,7 +108,7 @@ static void tle_spi_config(void) {
   spi.nss = SPI_NSS_SOFT;
   spi.endian = SPI_ENDIAN_MSB;
   spi.clock_polarity_phase = SPI_CK_PL_LOW_PH_2EDGE;  // SPI mode 1 (output rising, sample falling)
-  spi.prescale = SPI_PSC_16;                          // 60 MHz / 16 = 3.75 MHz
+  spi.prescale = SPI_PSC_8;                           // 60 MHz / 8 = 7.5 MHz (< 8 Mbit/s SSC limit)
   spi_init(TLE_SPI, &spi);
 
   spi_nss_internal_high(TLE_SPI);
@@ -137,6 +164,72 @@ static uint16_t tle_spi_xfer16(uint16_t word) {
   return spi_i2s_data_receive(TLE_SPI);
 }
 
+// Blocking single-register read (command + one data word). Init-time only.
+static uint16_t tle_read_reg_blocking(uint16_t cmd) {
+  gpio_bit_reset(TLE_CS_PORT, TLE_CS_PIN);
+  tle_delay_us(1U);
+  PB5_AS_AF();
+  (void)tle_spi_xfer16(cmd);
+  PB5_AS_INPUT();
+  tle_delay_us(2U);  // t_wr_delay before the sensor drives DATA
+  uint16_t data = tle_spi_xfer16(TLE_DUMMY);
+  gpio_bit_set(TLE_CS_PORT, TLE_CS_PIN);
+  PB5_AS_AF();
+  tle_delay_us(1U);  // tCSoff >= 600 ns before the next transfer
+  return data;
+}
+
+// Blocking single-register write: command + data word, then clock out the
+// safety word the sensor appends for ND=1 (keeps the transfer aligned; the
+// re-read in tle_verify_config is the actual verification).
+static void tle_write_reg_blocking(uint16_t cmd, uint16_t data) {
+  gpio_bit_reset(TLE_CS_PORT, TLE_CS_PIN);
+  tle_delay_us(1U);
+  PB5_AS_AF();
+  (void)tle_spi_xfer16(cmd);
+  (void)tle_spi_xfer16(data);
+  PB5_AS_INPUT();
+  tle_delay_us(2U);  // t_wr_delay before the sensor drives the safety word
+  (void)tle_spi_xfer16(TLE_DUMMY);
+  gpio_bit_set(TLE_CS_PORT, TLE_CS_PIN);
+  PB5_AS_AF();
+  tle_delay_us(1U);  // tCSoff >= 600 ns before the next transfer
+}
+
+// Verify the sensor runs the configuration this firmware assumes (fast filter
+// update, prediction, autocalibration mode 1 — the TLE5012B-E1000 fuse
+// defaults). A swapped derivate (E5000/E9000 ship with all three off and the
+// slow 85 us filter) would silently degrade the loop, so fix the volatile
+// registers on the spot and re-read to confirm. Writes are runtime-only; the
+// fuse defaults reload at every reset, which is exactly what we want.
+// Caveat: a MOD_2 write leaves the parameter CRC (TCO_Y CRCPAR) stale; with
+// AUTOCAL enabled that check is disabled, and the next power cycle reloads
+// self-consistent fuse values anyway.
+static bool tle_verify_config(void) {
+  cfg_mod1 = tle_read_reg_blocking(TLE_CMD_READ_MOD1);
+  cfg_mod2 = tle_read_reg_blocking(TLE_CMD_READ_MOD2);
+
+  // Slow filter (85/171 us) -> switch to the documented 42.7 us mode. The
+  // E1000's own 00 setting is fast and must be left alone.
+  if ((cfg_mod1 & TLE_MOD1_FIR_MD_SLOW) != 0U) {
+    cfg_mod1 = (cfg_mod1 & ~TLE_MOD1_FIR_MD_MASK) | TLE_MOD1_FIR_MD_42US;
+    tle_write_reg_blocking(TLE_CMD_WRITE_MOD1, cfg_mod1);
+    cfg_mod1 = tle_read_reg_blocking(TLE_CMD_READ_MOD1);
+  }
+
+  uint16_t want2 = (cfg_mod2 & ~TLE_MOD2_AUTOCAL_MASK) |
+                   TLE_MOD2_AUTOCAL_MODE1 | TLE_MOD2_PREDICT;
+  if (want2 != cfg_mod2) {
+    tle_write_reg_blocking(TLE_CMD_WRITE_MOD2, want2);
+    cfg_mod2 = tle_read_reg_blocking(TLE_CMD_READ_MOD2);
+  }
+
+  cfg_ok = ((cfg_mod1 & TLE_MOD1_FIR_MD_SLOW) == 0U) &&
+           ((cfg_mod2 & TLE_MOD2_PREDICT) != 0U) &&
+           ((cfg_mod2 & TLE_MOD2_AUTOCAL_MASK) == TLE_MOD2_AUTOCAL_MODE1);
+  return cfg_ok;
+}
+
 bool tle5012b_init(void) {
   read_busy = false;
   angle_raw = 0U;
@@ -144,6 +237,11 @@ bool tle5012b_init(void) {
   tle_gpio_config();
   tle_spi_config();
   tle_dma_config();
+
+  // Confirm the sensor is actually configured the way the control loop
+  // assumes (see tle_verify_config); the result is readable via
+  // tle5012b_config_ok() for diagnostics.
+  (void)tle_verify_config();
 
   uint32_t guard = TLE_READ_TIMEOUT;
   tle5012b_start_read();
@@ -206,6 +304,23 @@ uint16_t tle5012b_read_raw_blocking(void) {
 // healthy bus). 0xFFFF/0x0000 means SCK/MOSI/MISO are not reaching the sensor.
 uint16_t tle5012b_debug_cmd_echo(void) {
   return dbg_cmd_echo;
+}
+
+// True when the init-time config read-back confirmed (or successfully
+// corrected) fast filter update + prediction + autocalibration mode 1.
+bool tle5012b_config_ok(void) {
+  return cfg_ok;
+}
+
+// Raw MOD_1/MOD_2 register values as last read back during init (after any
+// correction), for diagnostics.
+void tle5012b_get_config(uint16_t *mod1, uint16_t *mod2) {
+  if (mod1 != 0) {
+    *mod1 = cfg_mod1;
+  }
+  if (mod2 != 0) {
+    *mod2 = cfg_mod2;
+  }
 }
 
 void DMA1_Channel0_IRQHandler(void) {

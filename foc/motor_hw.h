@@ -101,6 +101,15 @@ void motor_hw_driver_reset(void);
 // Basic encoder health check (bus alive). False if the encoder link looks dead.
 bool motor_hw_encoder_ok(void);
 
+// True when the init-time sensor config read-back confirmed (or corrected to)
+// fast filter update + prediction + autocalibration mode 1. False means the
+// fitted derivate could not be configured as assumed — the loop runs but with
+// degraded angle quality. Surfaced in the shell `status` output.
+bool motor_hw_encoder_config_ok(void);
+
+// Raw encoder MOD_1 / MOD_2 config register read-back (post-correction).
+void motor_hw_encoder_get_config(uint16_t *mod1, uint16_t *mod2);
+
 void motor_hw_set_pwm(uint32_t ccr_u, uint32_t ccr_v, uint32_t ccr_w);
 
 void motor_hw_set_pwm_brake(void);

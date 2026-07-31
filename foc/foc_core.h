@@ -173,7 +173,9 @@ void foc_set_limit(motor_t *motor, foc_limit_sel_t sel, float lim);
 /* Called every PWM period from the ADC inserted-conversion ISR. */
 void foc_control_loop(motor_t *motor);
 
-/* Called when the encoder DMA read completes (processes the raw angle). */
+/* Called at the top of every control tick to convert the raw encoder word
+ * (from the DMA read kicked at the end of the previous tick) into mech/elec
+ * angle. Runs in the control-loop context only — never from the DMA ISR. */
 void foc_encoder_callback(motor_t *motor);
 
 #endif /* FOC_CORE_H */

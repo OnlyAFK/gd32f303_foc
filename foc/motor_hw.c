@@ -75,6 +75,14 @@ bool motor_hw_encoder_ok(void) {
   return (echo != 0x0000u) && (echo != 0xFFFFu);
 }
 
+bool motor_hw_encoder_config_ok(void) {
+  return tle5012b_config_ok();
+}
+
+void motor_hw_encoder_get_config(uint16_t *mod1, uint16_t *mod2) {
+  tle5012b_get_config(mod1, mod2);
+}
+
 // Phase mapping for this board (verified on the dgm reference):
 //   phase A = u -> CH2 (PA10/INHA), current IA (PA3)
 //   phase B = v -> CH1 (PA9/INHB),  current IB (PA2)

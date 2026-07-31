@@ -43,6 +43,15 @@
 #define DEFAULT_PLL_KP          200.0f
 #define DEFAULT_PLL_KI          40000.0f
 
+/* Total angle lag compensated by the electrical-angle extrapolation below.
+ * Bench-measured on this unit (dqavg vd-offset method, +/-1500 rpm):
+ *   vd_offset = -lag * omega_e * flux  ->  total lag ~122 us, so
+ *   sensor internal delay ~65 us (FIR_MD=00; the datasheet only documents
+ *   FIR_MD=01) + SSC transfer ~5 us + pipeline 50 us (read kicked at the
+ *   end of tick N, processed at the top of tick N+1).
+ * At 14 pole pairs every microsecond of lag shows up 14x electrically. */
+#define ENCODER_LAG_S           0.000120f
+
 /* Control periods (CONTROL_DT aliases the hardware PWM period in motor_hw.h) */
 #define CONTROL_DT              HW_CONTROL_PERIOD_S
 #define POS_LOOP_DT             0.001f
@@ -511,9 +520,14 @@ void foc_set_limit(motor_t *motor, foc_limit_sel_t sel, float lim) {
 void foc_encoder_callback(motor_t *motor) {
   motor_hw_process_encoder_data(&motor->sensor.encoder);
 }
-
 void foc_control_loop(motor_t *motor) {
   motor_hw_debug_pin(1);
+
+  /* 0. Process the encoder word that landed from the read kicked at the end
+   * of the previous tick (the DMA transfer takes ~5 us, so it is guaranteed
+   * complete by now). Doing this here — not in the DMA-complete ISR — keeps
+   * all encoder state single-writer and removes the mid-loop update race. */
+  foc_encoder_callback(motor);
 
   /* Track the real bus voltage for correct SVPWM scaling. */
   float vbus = motor_hw_get_vbus();
@@ -540,20 +554,17 @@ void foc_control_loop(motor_t *motor) {
     }
   }
 
-  /* 2. Start encoder read (async via DMA, processed in foc_encoder_callback) */
-  motor_hw_start_encoder_read();
-
-  /* 3. Clarke transform: Iabc → Iαβ */
+  /* 2. Clarke transform: Iabc → Iαβ */
   motor->xform.clarke.ia = motor->sensor.currents.iu;
   motor->xform.clarke.ib = motor->sensor.currents.iv;
   motor->xform.clarke.ic = motor->sensor.currents.iw;
   clarke_calc(&motor->xform.clarke);
 
-  /* 4. PLL speed estimation */
+  /* 3. PLL speed estimation */
   pll_update(&motor->ctrl.speed_pll, motor->sensor.encoder.mech_angle, CONTROL_DT);
   motor->actual.rpm = motor->ctrl.speed_pll.speed_rpm;
 
-  /* 5. Select the electrical angle used by this cycle */
+  /* 4. Select the electrical angle used by this cycle */
   float ctrl_theta;
   if (motor->state == FOC_STATE_OPENLOOP_VOLT) {
     float elec_speed = motor->target.rpm * FOC_RPM_TO_RAD * (float)HW_MOTOR_POLE_PAIRS;
@@ -566,10 +577,15 @@ void foc_control_loop(motor_t *motor) {
   } else if (foc_ident_locks_rotor(motor)) {
     ctrl_theta = 0.0f;             /* lock rotor to phase A for Rs / Ld / Lq */
   } else {
-    ctrl_theta = motor->sensor.encoder.elec_angle;
+    /* First-order extrapolation to cancel the sensor + pipeline lag
+     * (ENCODER_LAG_S): the raw angle describes where the rotor was ~100 us
+     * ago. omega_e is the PLL mechanical speed mapped to electrical. */
+    float omega_e = motor->ctrl.speed_pll.speed_rad_s * (float)HW_MOTOR_POLE_PAIRS;
+    ctrl_theta = normalize_angle(motor->sensor.encoder.elec_angle +
+                                 omega_e * ENCODER_LAG_S);
   }
 
-  /* 6. Park transform: Iαβ → Idq */
+  /* 5. Park transform: Iαβ → Idq */
   motor->xform.park.alpha = motor->xform.clarke.alpha;
   motor->xform.park.beta  = motor->xform.clarke.beta;
   motor->xform.park.theta = ctrl_theta;
@@ -578,7 +594,7 @@ void foc_control_loop(motor_t *motor) {
   motor->actual.id = motor->xform.park.d;
   motor->actual.iq = motor->xform.park.q;
 
-  /* 6b. Anti-cogging calibration hook. Runs every tick (20 kHz) so the held-iq
+  /* 5b. Anti-cogging calibration hook. Runs every tick (20 kHz) so the held-iq
    * averaging and per-bin accumulation get full-rate samples; it drives the creep
    * by setting the position controller's target + max_rpm, which the decimated
    * position/speed loops below then track (reusing the normal cascade — see
@@ -587,7 +603,7 @@ void foc_control_loop(motor_t *motor) {
     foc_acog_run(motor);
   }
 
-  /* 7. Position loop (decimated). Track position always; close it in POSITION
+  /* 6. Position loop (decimated). Track position always; close it in POSITION
    * and during the anti-cogging creep. */
   motor->pos_loop_cnt++;
   if (motor->pos_loop_cnt >= HW_POS_LOOP_DIV) {
@@ -601,7 +617,7 @@ void foc_control_loop(motor_t *motor) {
     }
   }
 
-  /* 8. Speed loop (decimated) */
+  /* 7. Speed loop (decimated) */
   motor->speed_loop_cnt++;
   if (motor->speed_loop_cnt >= HW_SPEED_LOOP_DIV) {
     motor->speed_loop_cnt = 0;
@@ -612,7 +628,7 @@ void foc_control_loop(motor_t *motor) {
     }
   }
 
-  /* 9. Produce the dq voltage for this state */
+  /* 8. Produce the dq voltage for this state */
   float vd_out = 0.0f;
   float vq_out = 0.0f;
 
@@ -664,24 +680,28 @@ void foc_control_loop(motor_t *motor) {
   motor->actual.vd = vd_out;
   motor->actual.vq = vq_out;
 
-  /* 10. Inverse Park: Vdq → Vαβ */
+  /* 9. Inverse Park: Vdq → Vαβ */
   motor->xform.inv_park.d = vd_out;
   motor->xform.inv_park.q = vq_out;
   motor->xform.inv_park.theta = ctrl_theta;
   inv_park_calc(&motor->xform.inv_park);
 
-  /* 11. SVPWM modulation */
+  /* 10. SVPWM modulation */
   motor->xform.svpwm.alpha = motor->xform.inv_park.alpha;
   motor->xform.svpwm.beta  = motor->xform.inv_park.beta;
   motor->xform.svpwm.udc = motor->vdc;
   motor->xform.svpwm.ts  = motor->pwm_period;
   svpwm_calc(&motor->xform.svpwm);
 
-  /* 12. PWM output */
+  /* 11. PWM output */
   motor_hw_set_pwm(motor->xform.svpwm.ccr1, motor->xform.svpwm.ccr2, motor->xform.svpwm.ccr3);
 
-  /* 13. Update telemetry */
+  /* 12. Update telemetry */
   vofa_update_from_motor(motor);
+
+  /* 13. Kick the next encoder read. It completes (~5 us) long before the next
+   * tick, where step 0 picks the result up. */
+  motor_hw_start_encoder_read();
 
   motor_hw_debug_pin(0);
 }

@@ -19,6 +19,76 @@ Entry template:
 
 ---
 
+## Encoder path: config verify + race removal + lag compensation — 2026-07-30
+### What
+- **SSC clock 3.75 -> 7.5 MHz** (`SPI_PSC_16` -> `SPI_PSC_8` in
+  `driver/tle5012b/tle5012b.c`): under the 8 Mbit/s SSC limit, roughly halves
+  the transfer time of each angle read.
+- **Init-time sensor config verify/correct** (`tle_verify_config` in
+  `tle5012b.c`): reads MOD_1 (0x06) / MOD_2 (0x08) with config-space access
+  (SSC Lock = 1010B) and checks FIR_MD fast (bits 15:14; 00 is the E1000 fuse
+  setting, 10/11 = 85/171 us slow modes), PREDICT = 1, AUTOCAL = mode 1 — the
+  TLE5012B-E1000 fuse defaults the control loop silently relied on. If a
+  swapped derivate (E5000/E9000 ship with all three off and the 85 us filter)
+  reads back wrong, the volatile registers are written to the target values
+  (writes use ND=1 + safety-word read-out; ND=0 writes are ignored by the
+  sensor) and re-read. Result + raw registers are exposed via
+  `tle5012b_config_ok()` / `tle5012b_get_config()` and the HAL wrappers
+  `motor_hw_encoder_config_ok()` / `motor_hw_encoder_get_config()`; the shell
+  `status` command prints them.
+- **Encoder read race removed**: the DMA-complete ISR no longer calls
+  `foc_encoder_callback` (it used to rewrite `encoder_data_t` mid-control-loop
+  from a higher-priority ISR). Now the loop processes the landed angle at the
+  top of each tick and kicks the next DMA read at the end of it
+  (`foc/interrupt.c` attaches only the ADC callback; the driver's
+  `tle5012b_attach_callback` hook is kept but unused by the FOC layer).
+- **Electrical-angle lag compensation** (`ENCODER_LAG_S` in `foc_core.c`):
+  first-order extrapolation `theta_e += omega_e * ENCODER_LAG_S` using the PLL
+  mechanical speed x pole pairs. Value bench-tuned on the target unit to
+  **120 us** via the dqavg vd-offset method (vd_offset = -lag * omega_e *
+  flux): sensor internal ~65 us (FIR_MD=00) + ~5 us SSC transfer + 50 us
+  one-tick pipeline. Without compensation the lag shows up as a -2.3 V DC
+  offset on vd at 1500 rpm; with 120 us it is ~0.
+- **New shell command `dqavg [ms]`**: averages the 20 kHz actual
+  vd/vq/id/iq/rpm over ~1 ms-spaced samples (default 1000 ms, feeds the
+  watchdog while blocking). Instantaneous `dump` values alias the commutation
+  ripple and cannot resolve DC offsets. The current PI regulates DC id to
+  zero by design, so residual encoder lag is observed as a DC offset in vd
+  (~= -lag_error * omega_e * flux, same sign in both directions, ~speed^2);
+  `residual_lag_s ~= vd_offset / (omega_e * (vq - R*iq))`.
+- Version bumped 0.2.7 -> 0.2.8 (PATCH: logic changed, stored params kept).
+### Why
+- The firmware never wrote a single sensor register; it implicitly depended on
+  the E1000 fuse defaults (autocal mode 1 + prediction + 42.7 us update). A
+  derivate swap would degrade the loop with no error anywhere.
+- The DMA ISR rewrote mech/elec angle floats while the 20 kHz loop was
+  reading them — a genuine torn-read race.
+- At 14 pole pairs, ~100 us of uncompensated lag is ~5 deg of electrical angle
+  error at 1000 RPM, growing linearly with speed.
+### How to use
+- `status` now ends with `enc cfg ok: MOD_1=0x.... MOD_2=0x.... (predict=1
+  autocal=1)`. `MISMATCH` means the fitted sensor could not be configured as
+  assumed — check the part number (should be TLE5012B-E1000).
+### Notes / follow-ups
+- Bench-bringup corrections (2026-07-30): the first cut of the verify used the
+  wrong FIR_MD bit field (14:13 instead of 15:14) and rejected the E1000's
+  actual 00 setting -> false MISMATCH; the register write path used ND=0,
+  which the sensor silently ignores. Both fixed; FIR_MD bit layout confirmed
+  against the TLE5012B User's Manual (MOD_1 register).
+- A MOD_2 write leaves the parameter CRC (TCO_Y CRCPAR) stale. Accepted: with
+  AUTOCAL enabled the calibration-CRC check is disabled, and the write is
+  volatile (fuse defaults reload at the next reset). If runtime writes ever
+  become user-facing, port the Infineon library's regularCrcUpdate().
+- Autocalibration needs ~1.5 revolutions after power-up (or after a >5 K
+  temperature step within 1.5 rev) to generate its parameters; expected, not
+  a fault.
+- Remaining sensor non-linearity (magnet eccentricity, tilt, stray field) is
+  NOT covered by chip autocal. If a high-precision position application needs
+  it, add a host-side LUT built from a constant-speed sweep (same pattern as
+  `foc_acog.c`) stored via `app/params.c`.
+
+---
+
 ## CAN hardening: bus-off auto-recovery + hardware node filter — 2026-07-29
 ### What
 - **Bus-off auto-recovery ON** (`CAN_AUTO_BUS_OFF_RECOVERY 1` in `bsp/can.c`):

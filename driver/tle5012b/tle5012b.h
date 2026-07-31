@@ -28,7 +28,9 @@ bool tle5012b_init(void);
 
 // Register a callback invoked from the DMA-complete ISR once a read started by
 // tle5012b_start_read() has finished and the angle has been stored. Pass NULL
-// to detach. Used by the FOC layer to process the angle right after it lands.
+// to detach. NOTE: the FOC layer polls at the top of its control tick instead
+// of using this hook, so angle processing stays off the DMA ISR (no shared-
+// state race with the control loop). Kept for non-FOC users.
 void tle5012b_attach_callback(void (*cb)(void));
 
 // Kick off a non-blocking DMA read of the angle register. The result lands in
@@ -52,6 +54,17 @@ uint16_t tle5012b_read_raw_blocking(void);
 // healthy bus it echoes the command driven on MOSI (~0x8020). A reading of
 // 0xFFFF or 0x0000 means SCK/MOSI/MISO are not reaching the sensor.
 uint16_t tle5012b_debug_cmd_echo(void);
+
+// True when the init-time config read-back confirmed (or successfully
+// corrected) the assumed sensor configuration: fast 42.7 us filter update,
+// prediction on, autocalibration mode 1 (the TLE5012B-E1000 fuse defaults).
+// False means a different derivate is fitted and could not be corrected —
+// the loop still runs but with degraded angle quality.
+bool tle5012b_config_ok(void);
+
+// Raw MOD_1 / MOD_2 register values as read back during init (after any
+// correction), for diagnostics.
+void tle5012b_get_config(uint16_t *mod1, uint16_t *mod2);
 
 #ifdef __cplusplus
 }

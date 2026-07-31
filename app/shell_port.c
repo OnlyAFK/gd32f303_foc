@@ -447,6 +447,16 @@ static int cmd_status(int argc, char *argv[]) {
   print_fault_names(f->latched);
   shellPrint(&s_shell, "\r\nDRV FS1=0x%03x FS2=0x%03x\r\n",
              (unsigned)f->drv_fs1, (unsigned)f->drv_fs2);
+
+  /* Encoder config read-back (init): fast filter + prediction + autocal
+   * mode 1 expected. A mismatch that could not be corrected means a different
+   * TLE5012B derivate is fitted and angle quality is degraded. */
+  uint16_t mod1, mod2;
+  motor_hw_encoder_get_config(&mod1, &mod2);
+  shellPrint(&s_shell, "enc cfg %s: MOD_1=0x%04x MOD_2=0x%04x (predict=%u autocal=%u)\r\n",
+             motor_hw_encoder_config_ok() ? "ok" : "MISMATCH",
+             (unsigned)mod1, (unsigned)mod2,
+             (unsigned)((mod2 >> 2) & 1u), (unsigned)(mod2 & 3u));
   return 0;
 }
 
@@ -462,6 +472,40 @@ static int cmd_dump(int argc, char *argv[]) {
   for (int i = 0; i <= VOFA_CH_SPEED_TARGET; i++) {
     print_f(names[i], vofa_data[i]);
   }
+  return 0;
+}
+
+// Average the 20 kHz actuals over ~1 ms-spaced samples so DC components are
+// visible above the commutation ripple (instantaneous `dump` values alias the
+// ripple and are useless for this). Used to tune the encoder angle-lag
+// compensation: the current PI regulates DC id to zero by design, so residual
+// lag shows up NOT in id but as a DC offset in vd (~= -lag_error * omega_e *
+// flux), growing with speed^2 and same-sign in both rotation directions.
+// residual_lag_s ~= vd_offset / (omega_e * (vq - R*iq)).
+static int cmd_dqavg(int argc, char *argv[]) {
+  uint32_t ms = (argc >= 2) ? (uint32_t)atoi(argv[1]) : 1000u;
+  if (ms == 0u || ms > 10000u) {
+    shellWriteString(&s_shell, "usage: dqavg [ms=1000, max 10000]\r\n");
+    return 0;
+  }
+  float sum_vd = 0.0f, sum_vq = 0.0f, sum_id = 0.0f, sum_iq = 0.0f, sum_rpm = 0.0f;
+  uint32_t n = 0u;
+  for (uint32_t t = 0u; t < ms; t++) {
+    sum_vd  += s_motor->actual.vd;
+    sum_vq  += s_motor->actual.vq;
+    sum_id  += s_motor->actual.id;
+    sum_iq  += s_motor->actual.iq;
+    sum_rpm += s_motor->actual.rpm;
+    n++;
+    fault_watchdog_feed();  // the background loop is blocked while we average
+    delay_ms(1);
+  }
+  shellPrint(&s_shell, "avg over %lu samples:\r\n", (unsigned long)n);
+  print_f("vd_V", sum_vd / (float)n);
+  print_f("vq_V", sum_vq / (float)n);
+  print_f("id_A", sum_id / (float)n);
+  print_f("iq_A", sum_iq / (float)n);
+  print_f("speed_rpm", sum_rpm / (float)n);
   return 0;
 }
 
@@ -695,6 +739,7 @@ const ShellCommand shellCommandList[] = {
   SHELL_CMD_ITEM(CMD_ATTR, stop, cmd_stop, stop -> IDLE),
   SHELL_CMD_ITEM(CMD_ATTR, status, cmd_status, show mode + targets + actuals + faults),
   SHELL_CMD_ITEM(CMD_ATTR, dump, cmd_dump, print all telemetry channels (text VOFA frame)),
+  SHELL_CMD_ITEM(CMD_ATTR, dqavg, cmd_dqavg, averaged vd/vq/id/iq/rpm over N ms: dqavg [ms]),
   SHELL_CMD_ITEM(CMD_ATTR, pid, cmd_pid, set PID gains: pid <id|iq|spd> <kp> <ki>),
   SHELL_CMD_ITEM(CMD_ATTR, lim, cmd_lim, set limit: lim <cur|spd> <value>),
   SHELL_CMD_ITEM(CMD_ATTR, clrfault, cmd_clrfault, clear active fault (ERROR -> IDLE)),
