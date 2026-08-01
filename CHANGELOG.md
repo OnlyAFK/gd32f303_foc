@@ -19,6 +19,235 @@ Entry template:
 
 ---
 
+## Cogging cal: two-pass iterative sweep, velocity gate, 1.5 rpm march — 2026-08-01
+### What
+- **Two-pass iterative learning**: the phase machine is now WARMUP_CW, CW1,
+  WARMUP_CCW, CCW1, COG_MID, WARMUP_CW2, CW2, WARMUP_CCW2, CCW2. Pass 1 builds
+  a rough map as before (CW writes, CCW averages -> friction cancels); COG_MID
+  removes its DC chunk-wise in the ISR (512 bins/tick) and enables it as LIVE
+  feed-forward; pass 2 re-sweeps both directions with the detents
+  pre-cancelled (far less sticking) and adds half of each direction's residual
+  into the map in place (map += residual/2 -> friction still cancels, the
+  residual lands exactly once).
+- **Sample source switched from measured iq to the speed-loop PI output**
+  (`target.iq`). With FF off it is the loop's disturbance estimate (the same
+  quantity ODrive samples); with FF on it is the residual — measured iq CANNOT
+  be used in pass 2 because physics demands the same actual current with or
+  without FF. Side benefit: the 1 kHz PI output is much cleaner than 20 kHz
+  measured current.
+- **Velocity gate**: samples taken while |rpm| > 2x the march rate or moving
+  backwards > 0.5x march are dropped — break-loose lurch windows carry inertia
+  + P-term torque, not cogging. A settled pre-lurch value is still committed
+  when the rotor leaves its bin.
+- **March 0.5 -> 1.5 rpm** (COG_REV_TICKS 2.4M -> 800k, 40 s/rev): 0.5 rpm sat
+  deep in the Stribeck stick-slip regime; 1.5 rpm keeps the cogging
+  disturbance at ~4.2 Hz (still below the ~10 Hz speed-loop bandwidth) while
+  moving out of the worst stiction region. Industrial drives learn their
+  cogging tables at 1-5 rpm (Kollmorgen 1 rpm, Siemens faults above 5 rpm).
+- **Default creep cap 10 -> 2 rpm** (`cog cal <rpm>` still overrides): bounds
+  the break-loose speed itself, so lurch samples stay quasi-settled.
+- Warm-up phases now keep the cmd pre-filter tracking so the first sampled
+  bins after a direction change are not dragged toward the previous level.
+- **March leash**: the target advance (and the phase clock) pauses whenever
+  the rotor lags more than 30 bins (~2.6 deg) behind the marching target.
+  Observed on the bench: after a direction reversal the rotor stayed parked by
+  stiction while the target marched 100+ deg away (`speed_ref` saturated at
+  the creep cap, iq ~0.22 A, integrator winding at only ~0.045 A/s with the
+  deployed `spd_ki`) — the eventual break-loose would have become a ~30 s
+  capped-speed chase whose samples are all P-term/integrator transient. With
+  the leash, the integrator winds against a FIXED error, the break-loose chase
+  is always <= the leash length, and paused ticks still sample (a parked rotor
+  with the integrator winding is a settled held-torque measurement; the
+  CW/CCW average cancels the stiction part).
+- **Drag feed-forward (`cog cal <rpm> <drag_A>`, default 0.3 A, clamp 2 A)**:
+  a direction-signed bias current added to the speed-loop output (target.iq)
+  for the whole sweep. The leash alone made the sweep CORRECT but not
+  FINISHABLE: with the deployed weak speed loop the rotor parked at nearly
+  every one of the 168 detents/rev and the nominally 3 min sweep ran past
+  30 min. The drag does the heavy lifting against stiction so the loop only
+  trims. It does not corrupt the map: the sampled target.iq includes the
+  drag, and being direction-signed it cancels in the CW/CCW average exactly
+  like friction. Added in foc_core.c right after the speed-loop pi_calc so
+  the sampler always sees the total drive current.
+### Why
+- The single-pass 0.5 rpm sweep on this joint actuator (stiff detents + 1:8
+  planetary-gearbox stiction) stick-slips: lurch windows polluted the map with
+  inertia/acceleration torque. Iterating on the residual with the rough map
+  already feeding forward is the standard fix (ODrive's "iteratively builds a
+  map"; ILC in the literature).
+### How to use
+- `cog cal [rpm] [drag_A]` — run the sweep (~3-4 min; watch `status` COG ->
+  IDLE). If the rotor stalls (iq_ref stuck at a small value, pos_deg not
+  following), re-run with a larger drag (e.g. `cog cal 2 0.5`). On success the
+  map auto-enables and saves as before; `cog info` shows
+  valid/enabled/covered/peak_A.
+- A `stop` during pass 2 no longer loses everything: the pass-1 map was
+  committed valid at COG_MID, so the rough map stays usable in RAM (flash is
+  only written on a natural completion).
+- Verify: `mode speed` + a low `speed`, `cog off` vs `cog on`; peak_A should
+  be similar to the previous single-pass map but low-speed ripple smaller.
+### Notes / follow-ups
+- **PARKED / UNSOLVED (2026-08-01)**: on the bench the rotor still does not
+  track the march well enough for a usable map (gearbox stiction + weak
+  deployed speed-loop gains; the sweep stalls or smears even with the leash
+  and drag FF). The feature is archived as-is — code compiles and is believed
+  sound, but the calibration did not produce a good map on this joint
+  actuator. When picking this up again: (a) consider tuning the speed loop
+  much stiffer for the sweep (save/restore spd kp/ki like landing_kp), (b)
+  consider measuring at a constant MODERATE speed from the speed ripple
+  (T = -J * dω/dt, J from foc_imech) instead of a quasi-static creep, (c)
+  re-check whether the deployed `spd_ki` after autocal is simply too small.
+- The table still spans ONE motor rev (encoder is on the motor rotor): gearbox
+  ripple periodic over one OUTPUT rev (8 motor revs) is not captured; if
+  low-speed tests show output-rev-periodic residual, add a second small
+  output-angle table.
+- Direction-specific tables (Siemens-style, one per direction) remain an
+  option if gearbox friction turns out too asymmetric for CW/CCW averaging.
+
+---
+
+## Cogging cal: slow continuous march instead of step-and-settle — 2026-07-31
+### What
+- **`cog cal` rewritten as a continuous slow march** (the dgm reference's
+  actual scheme): the position target advances at a constant ~0.5 rpm
+  (120 s/rev) while filtered iq (~10 ms lpf, like the reference's i_q_filt)
+  is sampled EVERY tick into the bin of the actual mech_angle. Each bin keeps
+  only the freshest sample of each visit; CCW pass averages into the CW bins.
+  Sweep time drops ~9 min -> ~4 min.
+- Sampling is binned by the ACTUAL angle (the reference bins by commanded
+  position), so tracking lag and stick-slip lurches cannot misalign samples.
+- The deadband-zeroing from 0.2.12 stays (it is still wider than one bin and
+  would stall the march); `creep_rpm` now only caps the catch-up speed after
+  a stiction break.
+- Version bumped 0.2.12 -> 0.2.13 (PATCH: bugfix, stored params kept).
+### Why
+- Step-and-settle cannot work at 4096 points on this motor: with stiff
+  cogging detents + static friction the rotor stick-slips — it sticks at each
+  0.00153 rad step until the speed integral breaks it loose, then lurches
+  across ~5 bins without settling. Coverage was 843/4096 (21%) on 0.2.12,
+  so finish() kept rejecting the map. The march approach never requires
+  settling: at 0.5 rpm the cogging disturbance is ~1.4 Hz, far below the
+  10 Hz speed-loop bandwidth, so the moving measurement equals the true
+  cogging torque (the old acog's failed creep ran at 6-10 rpm = 17-28 Hz,
+  past the loop bandwidth — that is the case its comments warned about).
+### How to use
+- Re-run `cog cal` (~4 min, rotor creeps one rev each way). `cog info` should
+  show `covered` near 4096 and `valid=1 enabled=1`; then `mode speed` +
+  `speed 20` to judge the compensation.
+### Notes / follow-ups
+- If coverage is still low, the rotor is not following the march at all
+  (stall): raise the speed-loop integral (`set spd_ki ...`) and retry.
+
+---
+
+## Cogging cal: zero the position deadband during the sweep — 2026-07-31
+### What
+- **`cog cal` now saves and zeroes `pos.deadband` for the sweep** (restored
+  with max_rpm/landing_kp by `foc_set_state` on any COG exit). The run-time
+  deadband (0.002 rad) is wider than one 4096-point bin (0.00153 rad): with
+  it on, the position loop output stayed zero until the error accumulated
+  past the band, so the rotor only lurched forward every 2-3 steps and never
+  settled on the bins in between — they stayed unwritten and
+  `foc_cogging_finish` rejected the map (`valid=0`) on the 3/4 coverage
+  check despite a fully completed ~9 min sweep.
+- **`cog info` shows the coverage** (`covered=N/4096`) from the last finished
+  sweep, so a rejected map is diagnosable without a debugger.
+- Version bumped 0.2.11 -> 0.2.12 (PATCH: bugfix, stored params kept).
+### Why
+- On 0.2.11 a completed sweep produced `valid=0 enabled=0 peak_A=0.314`:
+  finish() measured real holding currents but coverage was only ~half the
+  table. The old 1024-point acog never hit this because its step
+  (0.00614 rad) was much larger than the deadband.
+### How to use
+- Re-run `cog cal`; afterwards `cog info` should show `covered` near 4096 and
+  `valid=1 enabled=1`. Then `mode speed` + `speed 20` to judge the result.
+### Notes / follow-ups
+- If coverage still falls short, watch the rotor: it should creep smoothly
+  one rev each way. A stall mid-sweep points at speed-loop integral
+  (`set spd_ki`) or a mechanical obstruction, not the map code.
+
+---
+
+## Encoder-fault debounce + live echo diagnostic — 2026-07-31
+### What
+- **`FAULT_ENCODER` is now debounced** (`FAULT_ENCODER_DEBOUNCE_MS = 100`,
+  `foc/fault.c`): the SSC command-echo check tripped on a SINGLE bad sample
+  (0x0000/0xFFFF) and latched a fatal fault. PWM switching can corrupt an
+  occasional echo, so the bus must now read bad continuously for 100 ms before
+  tripping — still fast enough to catch a genuinely dead bus.
+- **`status` shows the live echo** (`enc echo=0x....`, ~0x8020 healthy) via a
+  new `motor_hw_encoder_cmd_echo()` accessor, so bus health can be watched
+  while driving.
+- Version bumped 0.2.10 -> 0.2.11 (PATCH: bugfix, stored params kept).
+### Why
+- Observed on 0.2.10: `FAULT_ENCODER` latched the instant a drive started
+  (`cog cal`), with the bus provably alive in IDLE (`clrfault` stayed clean).
+  A lone EMI-corrupted echo sample was killing the drive; once latched,
+  ERROR blocked everything (`autocal` only printed its banner).
+### How to use
+- `clrfault` clears a latched fault; if ENCODER now re-trips only after a
+  sustained 100 ms dead bus, check encoder power/wiring.
+- `status` -> `enc echo`: ~0x8020 (often the low bits vary) = healthy;
+  stuck 0x0000/0xFFFF = bus dead.
+### Notes / follow-ups
+- If echoes still glitch under drive, route the encoder cable away from the
+  phase wires / check grounding — the debounce tolerates rare glitches, not a
+  marginal bus.
+
+---
+
+## Cogging-torque compensation rewrite (4096-point int16 map) — 2026-07-31
+### What
+- **`foc/foc_acog` removed, replaced by `foc/foc_cogging`**: the scheme is
+  ported from the dgm reference firmware (`Firmware_app`, Source/anticogging.c)
+  — a position-indexed feed-forward torque-current map, learned offline and
+  added to the iq command at run time (same injection point as before,
+  `foc_core.c` iq loop, in CURRENT/SPEED/POSITION).
+- **Table density x4**: 4096 points per mechanical rev (~24 points per cogging
+  period — this motor has 24 slots / 28 poles = 168 cogging periods/rev, so
+  the old 1024-point table sampled each period only ~6 times, too coarse for
+  the harmonic content) of **int16 fixed point at 5000 counts/A** (0.2 mA/LSB,
+  ±6.55 A), replacing the old 1024-bin int8+scale map.
+- **Calibration**: `FOC_STATE_COG` sub-state machine driving the normal
+  position->speed->current cascade one bin per step (65 ms: 50 ms settle to
+  rest + 15 ms held-iq averaging). Phase structure from the reference:
+  100-step CW warm-up, 4096-step CW sampling pass, 100-step CCW warm-up,
+  4096-step CCW sampling pass averaged into the same bins (cancels static
+  friction). Bins are computed from the ACTUAL settled mech_angle (a small
+  position error cannot smear the map). ~9 min total. `foc_cogging_finish`
+  removes the DC component (cogging is zero-mean; DC is friction), clamps to
+  ±max_ff, and checks coverage (>= 3/4 of bins) before validating.
+- **Persistence moved out of the KVDB**: the 8 KB map does not fit a KVDB
+  blob (a KV must fit one 2 KB sector), so it lives in dedicated raw flash
+  pages 0x0803B000..0x0803E000 (12 KB, magic + CRC32 + count + enabled),
+  exactly like the reference's flash-page store. Keil IROM1 reduced
+  0x3E000 -> 0x3B000 (code+RO is ~74 KB, ample headroom). The old `"cogging"`
+  int8 blob KV is deleted at boot. `params_capture_cogging()` (shell `cog
+  on/off/clear`, COG-done edge) erases+programs immediately in IDLE.
+- **Shell command renamed** `acog` -> `cog` (same subcommands:
+  `cal [rpm]|on|off|clear|info`). Version bumped 0.2.9 -> 0.2.10 (PATCH:
+  stored params kept, the stale KV is dropped).
+### Why
+- The old map barely helped at low speed (`speed 20` still showed obvious
+  cogging jerks): 6 samples per cogging period + int8 quantisation made the
+  feed-forward too weak/coarse to cancel the real waveform.
+### How to use
+- `cog cal` — run the sweep (needs a prior `autocal`/alignment; ~9 min, rotor
+  steps one rev each way; keep clear, watch `status` COG -> IDLE). On success
+  the map auto-enables and saves.
+- `cog on` / `cog off` — A/B the feed-forward at low speed; `cog info` shows
+  valid/enabled/peak_A; `cog clear` discards the map (erases flash copy).
+- Verify: `mode speed` + `speed 20` with `cog off` vs `cog on`.
+### Notes / follow-ups
+- If jerks remain with a valid map, the next suspects are speed-loop bandwidth
+  (`tunespd`, or `set spd_ki` for stiffer holding during calibration) and
+  residual friction — the feed-forward only cancels the position-dependent
+  part.
+- Re-run `cog cal` after any mechanical change; finalise the LTU table first
+  (it shifts the raw->mech mapping slightly).
+
+---
+
 ## Encoder linearization (LTU) + autocal stage — 2026-07-31
 ### What
 - **New module `foc/foc_ltu`**: encoder linearization via a 128-entry lookup

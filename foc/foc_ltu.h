@@ -8,7 +8,8 @@
  * INL, typically a few tenths of a degree), learned by an offline calibration
  * and applied to the raw encoder count at run time.
  *
- * Like foc_ident/foc_acog, the calibration is a commissioning-only sub-state
+ * Like foc_ident/foc_cogging, the calibration is a commissioning-only
+ * sub-state
  * machine that runs inside the FOC control ISR (state FOC_STATE_LTU) and
  * returns to IDLE when finished; foc_core.h includes this header to compose
  * ltu_ctx_t into motor_t. The sample buffer and the live table are module-

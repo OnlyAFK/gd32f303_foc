@@ -10,13 +10,13 @@
 
 /* motor_t is composed at the bottom of this header but forward-declared (tagged)
  * here so the sub-state-machine headers can take motor_t* parameters. Guard +
- * `struct motor_s` so the identical forward declarations in foc_acog.h and
+ * `struct motor_s` so the identical forward declarations in foc_cogging.h and
  * foc_ident.h coexist with this one. */
 #ifndef FOC_MOTOR_T_DEFINED
 #define FOC_MOTOR_T_DEFINED
 typedef struct motor_s motor_t;
 #endif
-#include "foc_acog.h"
+#include "foc_cogging.h"
 #include "foc_ident.h"   /* ident_ctx_t / imech_ctx_t + the ident/imech sub-state machines */
 #include "foc_ltu.h"     /* ltu_ctx_t + the encoder-linearization sub-state machine */
 
@@ -31,7 +31,7 @@ typedef enum {
   FOC_STATE_POSITION,        /* position loop -> speed -> current loop */
   FOC_STATE_IDENT,           /* electrical identification (Rs/Ld/Lq/flux) */
   FOC_STATE_IMECH,           /* mechanical identification (J/B/Tc), spins rotor */
-  FOC_STATE_ACOG,            /* anti-cogging map calibration (creeps one rev each way) */
+  FOC_STATE_COG,             /* cogging-torque map calibration (steps one rev each way) */
   FOC_STATE_LTU,             /* encoder linearization calibration (open-loop sweep) */
   FOC_STATE_ERROR,           /* fault latched, outputs off */
 } foc_state_t;
@@ -130,7 +130,7 @@ struct motor_s {
   cali_ctx_t cali;
   ident_ctx_t ident;
   imech_ctx_t imech;
-  acog_ctx_t acog;
+  cog_ctx_t cog;
   ltu_ctx_t ltu;
   float openloop_angle;   /* electrical angle for FOC_STATE_OPENLOOP_VOLT */
 

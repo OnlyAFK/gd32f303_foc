@@ -276,7 +276,7 @@
               <OCR_RVCT4>
                 <Type>1</Type>
                 <StartAddress>0x8000000</StartAddress>
-                <Size>0x3e000</Size>
+                <Size>0x3b000</Size>
               </OCR_RVCT4>
               <OCR_RVCT5>
                 <Type>1</Type>
@@ -609,9 +609,9 @@
               <FilePath>..\foc\foc_core.c</FilePath>
             </File>
             <File>
-              <FileName>foc_acog.c</FileName>
+              <FileName>foc_cogging.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\foc\foc_acog.c</FilePath>
+              <FilePath>..\foc\foc_cogging.c</FilePath>
             </File>
             <File>
               <FileName>foc_ident.c</FileName>

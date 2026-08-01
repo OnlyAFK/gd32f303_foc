@@ -11,8 +11,8 @@
  * foc_core.h includes this header to compose the ctx structs into motor_t; the
  * run/query hooks below are the only seam back into foc_control_loop. */
 
-/* Guarded so foc_ident.h and foc_acog.h can both forward-declare motor_t when
- * foc_core.h includes both (a bare duplicate typedef is a C99 constraint
+/* Guarded so foc_ident.h and foc_cogging.h can both forward-declare motor_t
+ * when foc_core.h includes both (a bare duplicate typedef is a C99 constraint
  * violation under AC5). */
 #ifndef FOC_MOTOR_T_DEFINED
 #define FOC_MOTOR_T_DEFINED

@@ -205,19 +205,19 @@ int main(void) {
         if (prev_state == FOC_STATE_IMECH && cur_state == FOC_STATE_IDLE) {
             params_capture_identmech(&g_motor);
         }
-        // Finalise + persist the anti-cogging map when a calibration sweep
+        // Finalise + persist the cogging-torque map when a calibration sweep
         // finishes (heavy DC-removal/quantise math, kept out of the ISR). Only
-        // on a NATURAL completion (phase == ACOG_DONE); a `stop` abort leaves the
-        // phase mid-sweep, so the partial accumulation is discarded, not saved.
-        if (prev_state == FOC_STATE_ACOG && cur_state == FOC_STATE_IDLE &&
-            g_motor.acog.phase == ACOG_DONE) {
-            if (foc_acog_finish(&g_motor)) {
-                params_capture_acog(&g_motor);
+        // on a NATURAL completion (phase == COG_DONE); a `stop` abort leaves the
+        // phase mid-sweep, so the partial map is discarded, not saved.
+        if (prev_state == FOC_STATE_COG && cur_state == FOC_STATE_IDLE &&
+            g_motor.cog.phase == COG_DONE) {
+            if (foc_cogging_finish(&g_motor)) {
+                params_capture_cogging(&g_motor);
             }
         }
         // Finalise + persist the encoder linearization table when a sweep
         // finishes (FIR/decimate math, kept out of the ISR). Same natural-
-        // completion rule as acog: an aborted sweep is discarded.
+        // completion rule as cogging: an aborted sweep is discarded.
         if (prev_state == FOC_STATE_LTU && cur_state == FOC_STATE_IDLE &&
             g_motor.ltu.phase == LTU_DONE) {
             if (foc_ltu_finish(&g_motor)) {
@@ -264,10 +264,10 @@ int main(void) {
         fault_watchdog_feed();
 
         // Re-assert the held position target each ms so POSITION mode holds,
-        // but NOT during the anti-cogging creep — there foc_acog_run owns
-        // ctrl.pos.target_pos and this would fight it.
+        // but NOT during the cogging-calibration creep — there foc_cogging_run
+        // owns ctrl.pos.target_pos and this would fight it.
         foc_state_t pos_st = foc_get_state(&g_motor);
-        if (pos_st != FOC_STATE_ERROR && pos_st != FOC_STATE_ACOG) {
+        if (pos_st != FOC_STATE_ERROR && pos_st != FOC_STATE_COG) {
             foc_set_target_position(&g_motor, g_motor.target.pos);
         }
     }

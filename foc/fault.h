@@ -101,6 +101,10 @@ typedef enum {
 /* Debounce windows for the 1 ms background monitor (in ms). */
 #define FAULT_UV_DEBOUNCE_MS  200u
 #define FAULT_OV_DEBOUNCE_MS  20u
+/* Encoder echo must read bad continuously for this long before tripping — a
+ * single EMI-corrupted sample must not kill the drive. 100 ms is still fast
+ * enough to catch a genuinely dead bus before it can mislead the loop. */
+#define FAULT_ENCODER_DEBOUNCE_MS  100u
 
 /* Independent watchdog timeout (ms). The background loop must feed it faster
  * than this or the MCU resets (and PWM stops). */

@@ -108,7 +108,7 @@ static const char *state_name(foc_state_t s) {
   case FOC_STATE_POSITION:        return "POSITION";
   case FOC_STATE_IDENT:           return "IDENT";
   case FOC_STATE_IMECH:           return "IMECH";
-  case FOC_STATE_ACOG:            return "ACOG";
+  case FOC_STATE_COG:             return "COG";
   case FOC_STATE_LTU:             return "LTU";
   case FOC_STATE_ERROR:           return "ERROR";
   default:                        return "?";
@@ -291,21 +291,24 @@ static int cmd_stop(int argc, char *argv[]) {
   return 0;
 }
 
-// Anti-cogging map: calibrate / enable / disable / clear / info.
-//   acog cal [rpm]  start a calibration sweep (steps 1 rev each way; ~3.5 min)
-//   acog on|off     enable/disable the run-time feed-forward (persisted in IDLE)
-//   acog clear      discard the map (deletes the stored copy)
-//   acog            show map status
-static void acog_print_info(void) {
-  shellPrint(&s_shell, "acog: valid=%d enabled=%d\r\n",
-             (int)foc_acog_is_valid(s_motor), (int)foc_acog_is_enabled(s_motor));
-  print_f("  peak_A", foc_acog_peak(s_motor));
+// Cogging-torque compensation map: calibrate / enable / disable / clear / info.
+//   cog cal [rpm] [drag_A]  start a calibration sweep (two passes, ~3-4 min);
+//                           drag_A = bias current that drags the rotor past
+//                           stiction (default 0.3 A; raise if the rotor stalls)
+//   cog on|off     enable/disable the run-time feed-forward (persisted in IDLE)
+//   cog clear      discard the map (erases the stored copy)
+//   cog            show map status
+static void cog_print_info(void) {
+  shellPrint(&s_shell, "cog: valid=%d enabled=%d covered=%u/%u\r\n",
+             (int)foc_cogging_is_valid(s_motor), (int)foc_cogging_is_enabled(s_motor),
+             (unsigned)foc_cogging_coverage(s_motor), (unsigned)FOC_COG_TABLE_SIZE);
+  print_f("  peak_A", foc_cogging_peak(s_motor));
 }
 
-static int cmd_acog(int argc, char *argv[]) {
+static int cmd_cog(int argc, char *argv[]) {
   if (argc < 2) {
-    acog_print_info();
-    shellWriteString(&s_shell, "usage: acog <cal [rpm]|on|off|clear|info>\r\n");
+    cog_print_info();
+    shellWriteString(&s_shell, "usage: cog <cal [rpm] [drag_A]|on|off|clear|info>\r\n");
     return 0;
   }
   const char *sub = argv[1];
@@ -323,29 +326,30 @@ static int cmd_acog(int argc, char *argv[]) {
       shellWriteString(&s_shell, "current offsets not calibrated\r\n");
       return 0;
     }
-    float rpm = (argc >= 3) ? arg_f(argv[2]) : 0.0f;   /* 0 -> default creep */
-    foc_start_acog(s_motor, rpm, 0.0f);
-    shellWriteString(&s_shell, "anti-cogging cal started (~3.5 min):\r\n");
-    shellWriteString(&s_shell, "  rotor STEPS one rev each way - keep clear! watch 'status'\r\n");
+    float rpm  = (argc >= 3) ? arg_f(argv[2]) : 0.0f;   /* 0 -> default creep */
+    float drag = (argc >= 4) ? arg_f(argv[3]) : 0.0f;   /* 0 -> default drag */
+    foc_start_cogging(s_motor, rpm, 0.0f, drag);
+    shellWriteString(&s_shell, "cogging cal started (~3-4 min, two passes):\r\n");
+    shellWriteString(&s_shell, "  rotor CREEPS two revs each way - keep clear! watch 'status'\r\n");
   } else if (strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
     uint8_t on = (sub[1] == 'n');                      /* "on" vs "off" */
-    foc_acog_set_enable(s_motor, on);
+    foc_cogging_set_enable(s_motor, on);
     if (foc_get_state(s_motor) == FOC_STATE_IDLE) {
-      params_capture_acog(s_motor);                    /* persist the enable flag */
-      shellPrint(&s_shell, "acog %s (saved)\r\n", on ? "on" : "off");
+      params_capture_cogging(s_motor);                 /* persist the enable flag */
+      shellPrint(&s_shell, "cog %s (saved)\r\n", on ? "on" : "off");
     } else {
-      shellPrint(&s_shell, "acog %s (live; stop to persist)\r\n", on ? "on" : "off");
+      shellPrint(&s_shell, "cog %s (live; stop to persist)\r\n", on ? "on" : "off");
     }
   } else if (strcmp(sub, "clear") == 0) {
-    foc_acog_clear(s_motor);
+    foc_cogging_clear(s_motor);
     if (foc_get_state(s_motor) == FOC_STATE_IDLE) {
-      params_capture_acog(s_motor);                    /* invalid map -> deletes KV */
+      params_capture_cogging(s_motor);                 /* invalid map -> erases flash */
     }
-    shellWriteString(&s_shell, "acog map cleared\r\n");
+    shellWriteString(&s_shell, "cog map cleared\r\n");
   } else if (strcmp(sub, "info") == 0) {
-    acog_print_info();
+    cog_print_info();
   } else {
-    shellWriteString(&s_shell, "usage: acog <cal [rpm]|on|off|clear|info>\r\n");
+    shellWriteString(&s_shell, "usage: cog <cal [rpm]|on|off|clear|info>\r\n");
   }
   return 0;
 }
@@ -527,6 +531,10 @@ static int cmd_status(int argc, char *argv[]) {
              motor_hw_encoder_config_ok() ? "ok" : "MISMATCH",
              (unsigned)mod1, (unsigned)mod2,
              (unsigned)((mod2 >> 2) & 1u), (unsigned)(mod2 & 3u));
+  /* Live SSC echo (~0x8020 healthy; 0x0000/0xFFFF = bus dead). The ENCODER
+   * fault keys off this sample (debounced) — watch it here to judge bus
+   * health while driving. */
+  shellPrint(&s_shell, "enc echo=0x%04X\r\n", (unsigned)motor_hw_encoder_cmd_echo());
   return 0;
 }
 
@@ -802,7 +810,7 @@ const ShellCommand shellCommandList[] = {
   SHELL_CMD_ITEM(CMD_ATTR, identinfo, cmd_identinfo, show raw measurements of the last autocal run),
   SHELL_CMD_ITEM(CMD_ATTR, tune, cmd_tune, re-deploy current-loop gains: tune [bw_hz]),
   SHELL_CMD_ITEM(CMD_ATTR, tunespd, cmd_tunespd, re-deploy speed-loop gains: tunespd [bw_hz]),
-  SHELL_CMD_ITEM(CMD_ATTR, acog, cmd_acog, anti-cogging map: acog <cal [rpm]|on|off|clear|info>),
+  SHELL_CMD_ITEM(CMD_ATTR, cog, cmd_cog, cogging-torque comp: cog <cal [rpm]|on|off|clear|info>),
   SHELL_CMD_ITEM(CMD_ATTR, ltu, cmd_ltu, encoder linearization: ltu <cal [volts]|on|off|clear|info>),
   SHELL_CMD_ITEM(CMD_ATTR, cansend, cmd_cansend, CAN debug: cansend <id_hex> [b0..b7] (hex)),
   SHELL_CMD_ITEM(CMD_ATTR, canstat, cmd_canstat, CAN debug: bus stats + drain rx frames),
