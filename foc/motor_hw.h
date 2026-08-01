@@ -101,10 +101,6 @@ void motor_hw_driver_reset(void);
 // Basic encoder health check (bus alive). False if the encoder link looks dead.
 bool motor_hw_encoder_ok(void);
 
-// Live SSC command-phase echo (~0x8020 on a healthy bus, 0x0000/0xFFFF on a
-// dead one) — the raw sample behind motor_hw_encoder_ok(), for diagnostics.
-uint16_t motor_hw_encoder_cmd_echo(void);
-
 // True when the init-time sensor config read-back confirmed (or corrected to)
 // fast filter update + prediction + autocalibration mode 1. False means the
 // fitted derivate could not be configured as assumed — the loop runs but with

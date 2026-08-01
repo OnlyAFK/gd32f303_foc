@@ -19,6 +19,38 @@ Entry template:
 
 ---
 
+## Cogging-torque compensation REMOVED (feature parked) — 2026-08-01
+### What
+- **All cogging-torque compensation code removed**: `foc/foc_cogging.*` and
+  the legacy `foc/foc_acog.*` deleted; `FOC_STATE_COG`/`FOC_STATE_ACOG`, the
+  per-tick calibration hooks, the iq feed-forward lookup in the current loop,
+  the `cog`/`acog` shell commands, the params flash persistence (dedicated
+  pages + KV blob), and the Keil project entries all stripped. The current
+  loop is back to plain `pi_calc(iq, target.iq, actual.iq)`.
+- The feature itself is preserved in git history: commit `216df88` archives
+  the final attempt (two-pass iterative sweep + velocity gate + march leash +
+  drag feed-forward, 4096-point int16 map) with full design rationale in the
+  file-header comments and the CHANGELOG entries of 2026-07-31/08-01 below.
+### Why
+- On this joint actuator (stiff cogging detents + 1:8 planetary gearbox
+  stiction) the rotor cannot follow the slow measurement march with the
+  deployed speed-loop gains: the sweep stalls or smears even with the leash
+  and drag FF, so no usable map was ever produced. Feature parked rather than
+  shipping an unvalidated compensator.
+### How to use
+- Nothing to use — `cog`/`acog` commands no longer exist. To revive the
+  feature, start from commit `216df88` and see its CHANGELOG Notes/follow-ups:
+  (a) much stiffer speed loop during the sweep (save/restore spd kp/ki),
+  (b) measure at a constant moderate speed from the speed ripple
+  (T = -J * dω/dt, J from foc_imech) instead of a quasi-static creep,
+  (c) re-check the autocal-deployed `spd_ki`.
+### Notes / follow-ups
+- The historical CHANGELOG entries below (2026-06-09 through 2026-08-01) are
+  kept as the design record of the attempt; they describe code that no longer
+  exists in the tree.
+
+---
+
 ## Cogging cal: two-pass iterative sweep, velocity gate, 1.5 rpm march — 2026-08-01
 ### What
 - **Two-pass iterative learning**: the phase machine is now WARMUP_CW, CW1,

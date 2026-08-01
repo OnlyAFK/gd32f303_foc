@@ -28,7 +28,7 @@ libraries/  vendor code (CMSIS, GD32 SPL, lwrb, CMSIS-DSP, letter-shell, flashdb
 | `pid`, `pll`, `svpwm`, `filter`, `foc_math` | foc | Pure leaf math; depend only on `foc_math`/CMSIS-DSP |
 | `motor_hw` | foc | **HAL** — the *only* module that includes `driver/*` and bsp chip headers |
 | `foc_core` | foc | FOC state machine, cascaded loops |
-| `foc_ident`, `foc_cogging`, `foc_ltu` | foc | Commissioning sub-state machines (param ident, cogging-torque comp, encoder linearization); per-tick hooks from `foc_core`, big buffers as module-private statics, persistence via `params` (ltu = KVDB blob; cogging = dedicated flash pages, its 8 KB map does not fit a KV) |
+| `foc_ident`, `foc_ltu` | foc | Commissioning sub-state machines (param ident, encoder linearization); per-tick hooks from `foc_core`, big buffers as module-private statics, blob persistence via `params` |
 | `fault` | foc | Protection + error handling; consumes `motor_hw` only. Tunable thresholds live in `fault_cfg_t` (`fault_set_cfg`/`_get_cfg`), guarded/clamped to `*_HARD_*` limits |
 | `interrupt` | foc | ISR entry points / control-loop scheduling |
 | `vofa` | foc* | Telemetry formatting (see Known debts) |
@@ -41,7 +41,7 @@ libraries/  vendor code (CMSIS, GD32 SPL, lwrb, CMSIS-DSP, letter-shell, flashdb
 | `letter-shell` | libraries | Third-party command shell (export-OFF, manual command table) |
 | `flashdb` | libraries | Third-party KV store (KVDB-only) over FAL; top 8 KB of flash |
 | `shell_port` | app | letter-shell glue: io_stream binding, command table, `scope` mode |
-| `params` | app | Flash parameter service: KV store of gains/limits/calibration/thresholds + fault log, plus the cogging map in dedicated raw flash pages (0x0803B000, CRC32). Single RAM truth, applied via foc setters + `fault_set_cfg`; writes only in IDLE |
+| `params` | app | Flash parameter service: KV store of gains/limits/calibration/thresholds + fault log. Single RAM truth, applied via foc setters + `fault_set_cfg`; writes only in IDLE |
 | `main`, `gd32f30x_it` | app | Entry, sequencing, interrupt vector table |
 
 ## Dependency rules (red lines)
@@ -82,8 +82,8 @@ Any non-empty result from 2–4 is a layering leak to fix.
 
 - **`foc_core.c` (~700 lines)**: hosts the cascaded control loops. The
   parameter-identification sub-state-machines (Rs/Ld/Lq/flux electrical +
-  J/B/Tc mechanical) have been split into `foc/foc_ident`, the cogging-torque
-  sweep into `foc/foc_cogging`, and encoder linearization into `foc/foc_ltu`;
+  J/B/Tc mechanical) have been split into `foc/foc_ident`, and encoder
+  linearization into `foc/foc_ltu`;
   `foc_core` calls their per-tick hooks from the control ISR. No longer a
   split candidate on its own.
 - **Telemetry coupling**: `vofa` lives in `foc/` and `foc_core` *pushes* to it

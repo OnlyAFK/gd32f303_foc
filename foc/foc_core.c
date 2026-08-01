@@ -287,12 +287,7 @@ void foc_init(motor_t *motor) {
   pos_controller_init(&motor->ctrl.pos);
   pll_init(&motor->ctrl.speed_pll, DEFAULT_PLL_KP, DEFAULT_PLL_KI);
 
-  /* Cogging-torque map starts empty; params_init() loads a stored map (if any). */
-  motor->cog.valid = 0u;
-  motor->cog.enabled = 0u;
-  motor->cog.peak = 0.0f;
-
-  /* Encoder linearization table likewise; params_init() loads a stored one. */
+  /* Encoder linearization table starts empty; params_init() loads a stored one (if any). */
   motor->ltu.valid = 0u;
   motor->ltu.enabled = 0u;
   motor->ltu.peak = 0;
@@ -313,16 +308,6 @@ void foc_set_state(motor_t *motor, foc_state_t state) {
   /* Once in ERROR, only an explicit clear (-> IDLE) may leave it. */
   if (motor->state == FOC_STATE_ERROR && state != FOC_STATE_IDLE) {
     return;
-  }
-
-  /* Leaving the cogging-calibration sweep by ANY path (finished, `stop`, or a
-   * fault): restore the position-loop profile (hop-speed cap + boosted landing
-   * gain + zeroed deadband) that the calibration overrode, so a later position
-   * move behaves normally. */
-  if (motor->state == FOC_STATE_COG && state != FOC_STATE_COG) {
-    motor->ctrl.pos.max_rpm    = motor->cog.saved_max_rpm;
-    motor->ctrl.pos.landing_kp = motor->cog.saved_landing_kp;
-    motor->ctrl.pos.deadband   = motor->cog.saved_deadband;
   }
 
   switch (state) {
@@ -369,25 +354,6 @@ void foc_set_state(motor_t *motor, foc_state_t state) {
     motor->ctrl.pos.last_target_pos = motor->ctrl.pos.current_pos;
     motor->ctrl.pos.last_output_rpm = 0.0f;
     motor->target.pos               = motor->ctrl.pos.current_pos;
-    motor_hw_enable_driver();
-    break;
-
-  case FOC_STATE_COG:
-    /* The cogging-map calibration reuses the position->speed->current cascade,
-     * so it needs valid current offsets exactly like the position loop.
-     * foc_cogging_run drives the creep target each tick; reset the loops and
-     * the jerk limiter so the sweep starts from rest at the live position. */
-    if (!motor->sensor.cur_offset.is_calibrated) {
-      state = FOC_STATE_ERROR;
-      motor_hw_disable_driver();
-      motor_hw_set_pwm_brake();
-      break;
-    }
-    pid_reset(&motor->ctrl.id);
-    pid_reset(&motor->ctrl.iq);
-    pid_reset(&motor->ctrl.speed);
-    motor->ctrl.pos.last_target_pos = motor->ctrl.pos.current_pos;
-    motor->ctrl.pos.last_output_rpm = 0.0f;
     motor_hw_enable_driver();
     break;
 
@@ -623,17 +589,7 @@ void foc_control_loop(motor_t *motor) {
   motor->actual.id = motor->xform.park.d;
   motor->actual.iq = motor->xform.park.q;
 
-  /* 5b. Cogging-calibration hook. Runs every tick (20 kHz) so the held-iq
-   * averaging and per-bin sampling get full-rate samples; it drives the creep
-   * by setting the position controller's target + max_rpm, which the decimated
-   * position/speed loops below then track (reusing the normal cascade — see
-   * foc_cogging.h). No-op in every other state. */
-  if (motor->state == FOC_STATE_COG) {
-    foc_cogging_run(motor);
-  }
-
-  /* 6. Position loop (decimated). Track position always; close it in POSITION
-   * and during the cogging-calibration creep. */
+  /* 6. Position loop (decimated). Track position always; close it in POSITION. */
   motor->pos_loop_cnt++;
   if (motor->pos_loop_cnt >= HW_POS_LOOP_DIV) {
     motor->pos_loop_cnt = 0;
@@ -641,7 +597,7 @@ void foc_control_loop(motor_t *motor) {
     pos_controller_update_sensor(&motor->ctrl.pos, motor->sensor.encoder.mech_angle);
     motor->actual.pos = motor->ctrl.pos.current_pos;
 
-    if (motor->state == FOC_STATE_POSITION || motor->state == FOC_STATE_COG) {
+    if (motor->state == FOC_STATE_POSITION) {
       motor->target.rpm = pos_controller_calc(&motor->ctrl.pos);
     }
   }
@@ -651,17 +607,8 @@ void foc_control_loop(motor_t *motor) {
   if (motor->speed_loop_cnt >= HW_SPEED_LOOP_DIV) {
     motor->speed_loop_cnt = 0;
 
-    if (motor->state == FOC_STATE_SPEED || motor->state == FOC_STATE_POSITION ||
-        motor->state == FOC_STATE_COG) {
+    if (motor->state == FOC_STATE_SPEED || motor->state == FOC_STATE_POSITION) {
       motor->target.iq = pi_calc(&motor->ctrl.speed, motor->target.rpm, motor->actual.rpm);
-      if (motor->state == FOC_STATE_COG) {
-        /* Calibration drag feed-forward (see foc_cogging.c): a direction-
-         * signed bias current that breaks gearbox stiction so the march does
-         * not stall on a weak loop. Added INTO target.iq so the calibration
-         * sampler sees the total drive current; direction-symmetric, so it
-         * cancels in the CW/CCW average like friction. */
-        motor->target.iq += motor->cog.drag_ff;
-      }
     }
   }
 
@@ -679,13 +626,8 @@ void foc_control_loop(motor_t *motor) {
   case FOC_STATE_CURRENT:
   case FOC_STATE_SPEED:
   case FOC_STATE_POSITION:
-  case FOC_STATE_COG:
-    /* Add the cogging-torque feed-forward to the iq command (0 unless the map
-     * is valid AND enabled — so it is inert during the COG calibration itself,
-     * which keeps enabled=0 to avoid self-compensation). */
     vd_out = pi_calc(&motor->ctrl.id, motor->target.id, motor->actual.id);
-    vq_out = pi_calc(&motor->ctrl.iq, motor->target.iq + foc_cogging_lookup(motor),
-                     motor->actual.iq);
+    vq_out = pi_calc(&motor->ctrl.iq, motor->target.iq, motor->actual.iq);
     break;
 
   case FOC_STATE_CALI:

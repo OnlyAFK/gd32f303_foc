@@ -152,9 +152,8 @@ static const kv_field_t *field_find(const char *name) {
   return NULL;
 }
 
-static void save_fields(bool force);             /* defined below; used by params_init */
-static void load_cogging_from_flash(motor_t *m); /* defined below; used by params_init */
-static void load_ltu_from_flash(motor_t *m);     /* defined below; used by params_init */
+static void save_fields(bool force);          /* defined below; used by params_init */
+static void load_ltu_from_flash(motor_t *m);  /* defined below; used by params_init */
 
 /* ===================================================================
  * Stored-version guard.
@@ -276,10 +275,7 @@ void params_init(motor_t *motor) {
   if (compatible) {
     struct fdb_blob blob;
     fdb_kv_get_blob(&s_kvdb, "fault_log", fdb_blob_make(&blob, &s_flog, sizeof(s_flog)));
-    fdb_kv_del(&s_kvdb, "cogging");  /* drop the old foc_acog int8 blob KV (superseded
-                                      * by the raw-flash cogging map; no-op if absent) */
-    load_cogging_from_flash(motor);  /* restore a stored cogging-torque map */
-    load_ltu_from_flash(motor);      /* restore a stored encoder linearization table */
+    load_ltu_from_flash(motor);    /* restore a stored encoder linearization table */
   }
 
   params_to_motor(&s_params, motor);
@@ -355,126 +351,10 @@ void params_capture_identmech(const motor_t *motor) {
   s_dirty = true;
 }
 
-/* ===================================================================
- * Cogging-torque map: dedicated raw flash pages + CRC32 (the dgm reference
- * firmware's approach). The 8 KB int16 map is far too big for a KVDB blob
- * (a KV must fit one 2 KB sector), so it lives in its own 12 KB region just
- * below the KVDB: 0x0803B000..0x0803E000. The Keil IROM1 size is reduced to
- * 0x3B000 so the linker never places code there. Flash is memory-mapped, so
- * the loader reads/verifies in place; saving erases + programs with the
- * motor IDLE (the callers guarantee it), interrupts masked like the KVDB
- * lock, feeding the watchdog through the slow erase/program loops.
- *
- * Layout (all little-endian words):
- *   +0  magic "COG1"
- *   +4  CRC32 of the map bytes
- *   +8  count (low 16) | enabled (high 16)
- *   +12 int16 map[FOC_COG_TABLE_SIZE]   (5000 counts per amp)
- * =================================================================== */
-#define COG_FLASH_ADDR   0x0803B000UL
-#define COG_FLASH_PAGES  6u                       /* 12 KB */
-#define COG_PAGE_SIZE    2048U
-#define COG_MAP_MAGIC    0x434F4731UL             /* "COG1" */
-#define COG_MAP_BYTES    (FOC_COG_TABLE_SIZE * 2u)
-
-static void cog_flash_clear_flags(void) {
-  /* GD32 fmc_flag_clear() decodes a single encoded flag per call — flags must
-   * NOT be OR'd together (same as bsp/flash_port.c). */
-  fmc_flag_clear(FMC_FLAG_BANK0_END);
-  fmc_flag_clear(FMC_FLAG_BANK0_WPERR);
-  fmc_flag_clear(FMC_FLAG_BANK0_PGERR);
-}
-
-/* Classic CRC32 (poly 0xEDB88320, reflected), bitwise — ~8 KB is a few ms,
- * called only on the slow save/load paths. */
-static uint32_t cog_crc32(const void *data, uint32_t len) {
-  const uint8_t *p = (const uint8_t *)data;
-  uint32_t crc = 0xFFFFFFFFUL;
-  while (len-- > 0u) {
-    crc ^= *p++;
-    for (uint32_t b = 0u; b < 8u; b++) {
-      crc = (crc >> 1) ^ (0xEDB88320UL & (uint32_t)(-(int32_t)(crc & 1u)));
-    }
-  }
-  return ~crc;
-}
-
-/* Persist the cogging map to its flash region (or ERASE the region when the
- * map is invalid — the `cog clear` semantics). Writes flash immediately, so
- * call it only with the motor IDLE — e.g. on the COG-done edge (COG -> IDLE)
- * or after the `cog on/off` shell toggle so the enable flag survives a
- * reboot. */
-void params_capture_cogging(const motor_t *motor) {
-  const int16_t *table = foc_cogging_table(motor);
-  uint32_t addr;
-  uint32_t i;
-
-  __disable_irq();
-  fmc_unlock();
-  cog_flash_clear_flags();
-
-  for (i = 0u; i < COG_FLASH_PAGES; i++) {
-    if (fmc_page_erase(COG_FLASH_ADDR + i * COG_PAGE_SIZE) != FMC_READY) {
-      goto out;
-    }
-    cog_flash_clear_flags();
-    fwdgt_counter_reload();             /* flash ops are slow; feed the dog */
-  }
-
-  if (table != NULL) {
-    uint32_t hdr[3];
-    hdr[0] = COG_MAP_MAGIC;
-    hdr[1] = cog_crc32(table, COG_MAP_BYTES);
-    hdr[2] = (uint32_t)FOC_COG_TABLE_SIZE |
-             ((uint32_t)foc_cogging_is_enabled(motor) << 16);
-
-    addr = COG_FLASH_ADDR;
-    for (i = 0u; i < 3u; i++, addr += 4u) {
-      if (fmc_word_program(addr, hdr[i]) != FMC_READY) {
-        goto out;
-      }
-      cog_flash_clear_flags();
-    }
-    /* Program the map word by word (the int16 table is word-aligned). */
-    const uint32_t *w = (const uint32_t *)table;
-    for (i = 0u; i < COG_MAP_BYTES / 4u; i++, addr += 4u) {
-      if (fmc_word_program(addr, w[i]) != FMC_READY) {
-        goto out;
-      }
-      cog_flash_clear_flags();
-      if (*(volatile uint32_t *)addr != w[i]) {   /* read-back verify */
-        goto out;
-      }
-      fwdgt_counter_reload();
-    }
-  }
-
-out:
-  fmc_lock();
-  __enable_irq();
-}
-
-/* Load a stored cogging map (if any) straight into foc_cogging's live table.
- * Internal to params_init; bad magic/count/CRC leaves the map disabled. */
-static void load_cogging_from_flash(motor_t *motor) {
-  const uint32_t *hdr = (const uint32_t *)COG_FLASH_ADDR;
-  const int16_t *table = (const int16_t *)(COG_FLASH_ADDR + 12u);
-
-  if (hdr[0] != COG_MAP_MAGIC) {
-    return;
-  }
-  if ((uint16_t)(hdr[2] & 0xFFFFu) != (uint16_t)FOC_COG_TABLE_SIZE) {
-    return;
-  }
-  if (cog_crc32(table, COG_MAP_BYTES) != hdr[1]) {
-    return;
-  }
-  foc_cogging_load_table(motor, table, (uint8_t)(hdr[2] >> 16));
-}
-
-/* Encoder linearization table blob KV — same immediate-write pattern as the
- * anti-cogging map (the callers guarantee IDLE). The blob is owned/serialised
- * by foc_ltu (int16 table). */
+/* Encoder linearization table blob KV. Kept out of the field table (far larger
+ * than any scalar) and written immediately like the fault log rather than via
+ * the deferred dirty/IDLE path — the callers already guarantee the motor is
+ * IDLE. The blob is owned/serialised by foc_ltu (int16 table). */
 #define KEY_LTU  "ltu"
 
 void params_capture_ltu(const motor_t *motor) {

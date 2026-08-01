@@ -75,10 +75,6 @@ bool motor_hw_encoder_ok(void) {
   return (echo != 0x0000u) && (echo != 0xFFFFu);
 }
 
-uint16_t motor_hw_encoder_cmd_echo(void) {
-  return tle5012b_debug_cmd_echo();
-}
-
 bool motor_hw_encoder_config_ok(void) {
   return tle5012b_config_ok();
 }

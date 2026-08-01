@@ -7,8 +7,7 @@
 #include "fault.h"
 
 /*
- * Persistent parameter storage (FlashDB KVDB, top 8 KB of flash; the 12 KB
- * below it holds the cogging-torque map, see params.c).
+ * Persistent parameter storage (FlashDB KVDB, top 8 KB of flash).
  *
  * Single runtime source of truth is `params_t` in RAM. The compile-time
  * DEFAULT_ / HW_ macros in foc_core/motor_hw remain the factory fallback: at
@@ -104,13 +103,6 @@ void params_capture_ident(const motor_t *motor);
 /* Capture the motor's identified mechanical parameters (J/B/Tc) into the
  * parameter set and mark dirty. Call on the IMECH-done edge (IMECH -> IDLE). */
 void params_capture_identmech(const motor_t *motor);
-
-/* Persist the cogging-torque map to its dedicated flash pages (or erase them
- * if the map is invalid). Unlike the small fields this writes flash
- * immediately, so call it only with the motor IDLE — e.g. on the COG-done
- * edge (COG -> IDLE) or after the `cog on/off` shell toggle so the enable
- * flag survives a reboot. */
-void params_capture_cogging(const motor_t *motor);
 
 /* Persist (or, if the table is invalid, delete) the encoder linearization
  * table as a compact blob KV ("ltu"). Writes flash immediately, so call it
