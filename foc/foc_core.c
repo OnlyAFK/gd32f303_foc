@@ -2,6 +2,7 @@
 #include <math.h>
 #include "fault.h"
 #include "vofa.h"
+#include "params.h"
 
 /* Current loop defaults — deployed from the identified motor parameters
  * (Rs=0.243 ohm, Ld=110 uH, Lq=158 uH) at a 1 kHz closed-loop bandwidth via
@@ -23,6 +24,24 @@
 #define DEFAULT_SPD_KP          0.0039f
 #define DEFAULT_SPD_KI          0.0227f
 #define DEFAULT_SPEED_LIMIT     5.0f
+
+/* Speed slew-rate limit [rpm/s]; 0 = instant step (backward compatible).
+ * Applied only in SPEED mode; POSITION has its own trajectory profiler.
+ * Default 3000 rpm/s: the rotor carries only ~1 J at 2000 rpm (J=4.8e-5), so
+ * this rate keeps the speed loop out of saturation and the regen power ~3 W —
+ * fast on the bench, gentle on the bus. Lower it for large reflected inertia. */
+#define DEFAULT_SPD_ACCEL       3000.0f
+
+/* Regen current limiting: when Vbus rises within this margin below the OV
+ * trip, regenerative (braking) iq is scaled down linearly to keep the rail
+ * from kicking through the hardware overvoltage trip. */
+#define DEFAULT_REGEN_MARGIN    4.0f
+
+/* MIT torque-current ceiling [A]; 0 = follow cur_limit. Default equals
+ * DEFAULT_SPEED_LIMIT: 12 A at 24 V pulls ~288 W, and on the bench that
+ * collapsed the supply rail into DRV UVLO (VM < ~5.6 V) during a stalled /
+ * high-impedance-error demand. 5 A keeps MIT within SPEED-mode power. */
+#define DEFAULT_MIT_CUR_LIM     5.0f
 
 /* Position loop defaults (cascade: position -> speed loop -> current loop)
  * max_rpm     : peak speed during a position move (RPM mechanical).
@@ -298,6 +317,22 @@ void foc_init(motor_t *motor) {
   motor->speed_loop_cnt = 0;
   motor->pos_loop_cnt = 0;
 
+  motor->spd_cmd_rpm  = 0.0f;
+  motor->spd_accel    = DEFAULT_SPD_ACCEL;
+  motor->regen_margin = DEFAULT_REGEN_MARGIN;
+
+  /* MIT impedance control starts inert: no command, no Kt. params_init() will
+   * set mit_kt (if stored) and derive mit_effective_kt from flux (if any). */
+  motor->mit_cmd.active   = 0;
+  motor->mit_cmd.pos_ref  = 0.0f;
+  motor->mit_cmd.vel_ref  = 0.0f;
+  motor->mit_cmd.kp       = 0.0f;
+  motor->mit_cmd.kd       = 0.0f;
+  motor->mit_cmd.tau_ff   = 0.0f;
+  motor->mit_kt           = 0.0f;
+  motor->mit_effective_kt = 0.0f;
+  motor->mit_cur_lim      = DEFAULT_MIT_CUR_LIM;
+
   motor_hw_init();
 
   /* Power-up always runs one current-offset calibration (no encoder align). */
@@ -335,6 +370,13 @@ void foc_set_state(motor_t *motor, foc_state_t state) {
     pid_reset(&motor->ctrl.id);
     pid_reset(&motor->ctrl.iq);
     pid_reset(&motor->ctrl.speed);
+    /* Entering SPEED mode zeroes both the ramped reference and the raw command
+     * so a stale setpoint cannot make the motor lurch on entry (the slew ramp
+     * otherwise resumes from the leftover target.rpm). */
+    if (state == FOC_STATE_SPEED) {
+      motor->target.rpm  = 0.0f;
+      motor->spd_cmd_rpm = 0.0f;
+    }
     motor_hw_enable_driver();
     break;
 
@@ -408,6 +450,59 @@ void foc_set_state(motor_t *motor, foc_state_t state) {
     motor_hw_enable_driver();
     break;
 
+  case FOC_STATE_MIT: {
+    /* MIT impedance control drives torque through the current loop, so it needs
+     * valid current offsets (same gate as CURRENT/SPEED/POSITION). */
+    if (!motor->sensor.cur_offset.is_calibrated) {
+      state = FOC_STATE_ERROR;
+      motor_hw_disable_driver();
+      motor_hw_set_pwm_brake();
+      break;
+    }
+    /* Resolve the torque constant live: prefer the user-set mit_kt param,
+     * else derive from the identified flux (Kt = 1.5 * pole_pairs * flux).
+     * Re-reading here (rather than trusting the cached value) picks up a fresh
+     * `autocal` even if the motor struct was never re-synced. */
+    const params_t *p = params_get();
+    float kt = p->mit_kt;
+    if (kt <= 0.0f && p->flux > 0.0f) {
+      kt = 1.5f * (float)HW_MOTOR_POLE_PAIRS * (p->flux * 1.0e-3f);
+    }
+    motor->mit_effective_kt = kt;
+    if (motor->mit_effective_kt <= 0.0f) {
+      /* No torque constant (no `mit_kt`, no identified flux): refuse the mode
+       * without latching ERROR so the user can still set mit_kt / run autocal. */
+      state = FOC_STATE_IDLE;
+      motor_hw_disable_driver();
+      motor_hw_set_pwm_brake();
+      break;
+    }
+    pid_reset(&motor->ctrl.id);
+    pid_reset(&motor->ctrl.iq);
+    /* Do NOT reset the speed PID — MIT bypasses the speed loop entirely. */
+    /* Seed the position tracker now if the 1 kHz position-loop decimation has
+     * not initialized it yet, so the PD sees a real current_pos instead of the
+     * pre-init 0 (avoids a torque spike in the first ~1 ms of MIT mode). */
+    if (!motor->ctrl.pos.initialized) {
+      motor->ctrl.pos.last_theta = motor->sensor.encoder.mech_angle;
+      motor->ctrl.pos.current_pos = 0.0f;
+      motor->ctrl.pos.total_turns = 0;
+      motor->ctrl.pos.initialized = 1;
+    }
+    /* Hold the present angle; `active = 0` means zero torque until the first
+     * MIT command frame arrives (soft start). */
+    motor->mit_cmd.active   = 0;
+    motor->mit_cmd.pos_ref  = motor->ctrl.pos.current_pos;
+    motor->mit_cmd.vel_ref  = 0.0f;
+    motor->mit_cmd.kp       = 0.0f;
+    motor->mit_cmd.kd       = 0.0f;
+    motor->mit_cmd.tau_ff   = 0.0f;
+    motor->target.id = 0.0f;
+    motor->target.iq = 0.0f;
+    motor_hw_enable_driver();
+    break;
+  }
+
   case FOC_STATE_IDLE:
     motor_hw_disable_driver();
     motor_hw_set_pwm_brake();
@@ -419,6 +514,19 @@ void foc_set_state(motor_t *motor, foc_state_t state) {
     motor_hw_disable_driver();
     motor_hw_set_pwm_brake();
     break;
+  }
+
+  /* Leaving MIT: clear the impedance command so no stale pos_ref/vel_ref/kp/kd/
+   * tau survives into a later re-entry (ESTOP, `mode idle` or watchdog stop all
+   * land here). foc_set_state(MIT) would re-seed it anyway, but this keeps the
+   * struct clean and makes the soft-start on re-entry genuinely fresh. */
+  if (motor->state == FOC_STATE_MIT && state != FOC_STATE_MIT) {
+    motor->mit_cmd.active   = 0u;
+    motor->mit_cmd.pos_ref  = motor->ctrl.pos.current_pos;
+    motor->mit_cmd.vel_ref  = 0.0f;
+    motor->mit_cmd.kp       = 0.0f;
+    motor->mit_cmd.kd       = 0.0f;
+    motor->mit_cmd.tau_ff   = 0.0f;
   }
 
   motor->state = state;
@@ -473,12 +581,41 @@ void foc_set_target_current(motor_t *motor, float id, float iq) {
 }
 
 void foc_set_target_speed(motor_t *motor, float rpm) {
-  motor->target.rpm = rpm;
+  /* Store the raw command; the speed loop applies the slew ramp to
+   * target.rpm (so a step command becomes a controlled acceleration). */
+  motor->spd_cmd_rpm = rpm;
 }
 
 void foc_set_target_position(motor_t *motor, float pos_rad) {
   motor->target.pos = pos_rad;
   motor->ctrl.pos.target_pos = pos_rad;
+}
+
+void foc_set_mit_command(motor_t *motor, float pos_ref, float vel_ref,
+                         float kp, float kd, float tau_ff) {
+  /* Soft-start gate: the first command after entering MIT (active 0 -> 1) must
+   * not carry a stale host pos_ref/vel_ref — foc_set_state(MIT) seeds the mode
+   * with the present angle and active=0, and this frame would otherwise override
+   * that and jerk the rotor (large pos_err -> kp*tau -> current trip). Align to
+   * the present angle instead; kp/kd/tau still take effect from here. */
+  mit_cmd_t cmd;
+  if (motor->mit_cmd.active == 0u) {
+    pos_ref = motor->ctrl.pos.current_pos;
+    vel_ref = 0.0f;
+  }
+  /* Build the command locally, then commit atomically under the IRQ mask so the
+   * 20 kHz ISR never sees a partially-updated set of floats. */
+  cmd.pos_ref = pos_ref;
+  cmd.vel_ref = vel_ref;
+  cmd.kp      = kp;
+  cmd.kd      = kd;
+  cmd.tau_ff  = tau_ff;
+  cmd.active  = 1;
+
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  motor->mit_cmd = cmd;
+  __set_PRIMASK(primask);
 }
 
 void foc_set_pid_gains(motor_t *motor, foc_gain_sel_t sel, float kp, float ki) {
@@ -608,6 +745,25 @@ void foc_control_loop(motor_t *motor) {
     motor->speed_loop_cnt = 0;
 
     if (motor->state == FOC_STATE_SPEED || motor->state == FOC_STATE_POSITION) {
+      /* Speed slew ramp — SPEED mode only; POSITION's profiler already wrote
+       * target.rpm at step 6. When spd_accel==0, track the command instantly
+       * (backward compatible with the old direct-write behaviour). */
+      if (motor->state == FOC_STATE_SPEED) {
+        if (motor->spd_accel > 0.0f) {
+          float step = motor->spd_accel * CONTROL_DT * (float)HW_SPEED_LOOP_DIV;
+          float error = motor->spd_cmd_rpm - motor->target.rpm;
+          if (error > step) {
+            motor->target.rpm += step;
+          } else if (error < -step) {
+            motor->target.rpm -= step;
+          } else {
+            motor->target.rpm = motor->spd_cmd_rpm;
+          }
+        } else {
+          motor->target.rpm = motor->spd_cmd_rpm;
+        }
+      }
+
       motor->target.iq = pi_calc(&motor->ctrl.speed, motor->target.rpm, motor->actual.rpm);
     }
   }
@@ -626,8 +782,75 @@ void foc_control_loop(motor_t *motor) {
   case FOC_STATE_CURRENT:
   case FOC_STATE_SPEED:
   case FOC_STATE_POSITION:
-    vd_out = pi_calc(&motor->ctrl.id, motor->target.id, motor->actual.id);
-    vq_out = pi_calc(&motor->ctrl.iq, motor->target.iq, motor->actual.iq);
+  case FOC_STATE_MIT: {
+      float iq_cmd;
+      if (motor->state == FOC_STATE_MIT) {
+        /* MIT impedance law, evaluated every 20 kHz tick so the damping term
+         * tracks the PLL velocity at full bandwidth. Position error is the
+         * single-turn [0,2pi) reference vs the continuous multi-turn actual,
+         * wrapped to [-pi, pi]. active==0 (soft start) or an unusable Kt
+         * yields zero torque. */
+        float kt = motor->mit_effective_kt;
+        iq_cmd = 0.0f;
+        if (motor->mit_cmd.active && kt > 1.0e-9f) {
+          float pos_err = motor->mit_cmd.pos_ref - motor->ctrl.pos.current_pos;
+          while (pos_err > FOC_PI)  pos_err -= FOC_2PI;
+          while (pos_err < -FOC_PI) pos_err += FOC_2PI;
+
+          float vel_err = motor->mit_cmd.vel_ref - motor->ctrl.speed_pll.speed_rad_s;
+
+          float tau_cmd = motor->mit_cmd.tau_ff
+                        + motor->mit_cmd.kp * pos_err
+                        + motor->mit_cmd.kd * vel_err;
+          iq_cmd = tau_cmd / kt;
+        }
+        /* MIT is force control: the PD demand (kp*pos_err, tau_ff, 1/Kt) is
+         * unbounded, so clamp the torque current BEFORE it reaches the PI.
+         * The PI's own out_max is a VOLTAGE clamp — it cannot stop the phase
+         * current from running past FAULT_OC_SW_PEAK (14 A) while tracking a
+         * huge reference. The clamp is min(cur_limit, mit_cur_lim): 12 A at
+         * 24 V is ~288 W and collapses a bench supply into DRV UVLO (VM <
+         * ~5.6 V) on a stalled demand, so MIT defaults to the same 5 A
+         * ceiling as SPEED mode. */
+        float cur_lim = motor->ctrl.iq.out_max;
+        if (motor->mit_cur_lim > 0.0f && motor->mit_cur_lim < cur_lim) {
+          cur_lim = motor->mit_cur_lim;
+        }
+        if (iq_cmd >  cur_lim) iq_cmd =  cur_lim;
+        if (iq_cmd < -cur_lim) iq_cmd = -cur_lim;
+        motor->target.id = 0.0f;
+      } else {
+        iq_cmd = motor->target.iq;
+      }
+      /* Regen current limiting: when Vbus rises within regen_margin of the OV
+       * trip, scale down the regenerative (braking) component of iq so the
+       * rail cannot kick through the hardware overvoltage trip. Only the
+       * direction opposing rotation (iq * rpm < 0) is limited; motoring is
+       * untouched. The speed loop re-derives target.iq every 1 ms from its PI
+       * state, so a local copy is used here — never destructively modify it. */
+      if (motor->regen_margin > 0.01f && (iq_cmd * motor->actual.rpm) < 0.0f) {
+        const fault_cfg_t *fcfg = fault_get_cfg();
+        float vbus_safe = fcfg->vbus_ov_trip - motor->regen_margin;
+        if (vbus > vbus_safe) {
+          if (vbus >= fcfg->vbus_ov_trip) {
+            iq_cmd = 0.0f;
+          } else {
+            iq_cmd *= (fcfg->vbus_ov_trip - vbus) / motor->regen_margin;
+          }
+        }
+      }
+      /* Expose the FINAL iq (after clamp + regen limiting) as target.iq so the
+       * telemetry and the slow fault monitor (phase-loss arming on iq_cmd)
+       * see what the current loop actually tracked. MIT only — for the
+       * cascaded modes target.iq is the speed-loop output and must not be
+       * overwritten here (the speed loop re-derives it every 1 ms). */
+      if (motor->state == FOC_STATE_MIT) {
+        motor->target.iq = iq_cmd;
+      }
+
+      vd_out = pi_calc(&motor->ctrl.id, motor->target.id, motor->actual.id);
+      vq_out = pi_calc(&motor->ctrl.iq, iq_cmd, motor->actual.iq);
+    }
     break;
 
   case FOC_STATE_CALI:

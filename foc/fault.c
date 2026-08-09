@@ -194,7 +194,8 @@ bool fault_check_fast(float iu, float iv, float iw, float vbus, float iq,
 }
 
 void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
-                        float iu, float iv, bool driving, uint32_t tick_ms) {
+                        float iu, float iv, bool driving, bool stall_en,
+                        uint32_t tick_ms) {
   s_tick_ms = tick_ms;
 
   // --- Gate-driver status decode (only when the pin is asserted or an edge is
@@ -245,7 +246,10 @@ void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
   }
 
   // --- Stall: torque current high but rotor not turning, sustained -------
-  if (driving && fabsf(iq) > s_cfg.stall_iq && fabsf(rpm) < s_cfg.stall_rpm) {
+  // Gated by stall_en: force-control modes (MIT) legitimately hold a blocked
+  // rotor (a legal impedance-control operating point), so their caller passes
+  // false; I^2 t / thermal protection still cover the sustained-overload case.
+  if (driving && stall_en && fabsf(iq) > s_cfg.stall_iq && fabsf(rpm) < s_cfg.stall_rpm) {
     if (s_stall_since == 0u) s_stall_since = tick_ms ? tick_ms : 1u;
     if ((tick_ms - s_stall_since) >= FAULT_STALL_MS) {
       fault_raise(FAULT_STALL, vbus, iq);

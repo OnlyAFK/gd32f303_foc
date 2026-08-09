@@ -197,9 +197,13 @@ bool fault_check_fast(float iu, float iv, float iw, float vbus, float iq,
 // edge is pending or the pin is still low, runs the debounced bus checks, the
 // I^2 t accumulator, and the stall / overspeed / phase-loss / encoder detectors.
 // `iq_cmd` is the commanded torque current (used to arm phase-loss detection);
-// `tick_ms` is a free-running millisecond counter supplied by the caller.
+// `stall_en` gates the stall detector — force-control modes (MIT) hold a
+// blocked rotor as a legal operating point, so their caller passes false while
+// I^2 t / thermal protection still run; `tick_ms` is a free-running millisecond
+// counter supplied by the caller.
 void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
-                        float iu, float iv, bool driving, uint32_t tick_ms);
+                        float iu, float iv, bool driving, bool stall_en,
+                        uint32_t tick_ms);
 
 // Attempt to clear all faults. Returns true only if every active condition has
 // physically cleared (bus back in range, DRV nFAULT released, etc.); latching

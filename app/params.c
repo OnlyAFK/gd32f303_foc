@@ -80,6 +80,8 @@ static const kv_field_t s_fields[] = {
   KV_F("spd_kp",    spd_kp,             PT_F32),
   KV_F("spd_ki",    spd_ki,             PT_F32),
   KV_F("spd_lim",   spd_limit,          PT_F32),
+  KV_F("spd_acc",   spd_accel,          PT_F32),
+  KV_F("regen_mrg", regen_margin,       PT_F32),
   KV_F("pos_rpm",   pos_max_rpm,        PT_F32),
   KV_F("pos_acc",   pos_max_accel,      PT_F32),
   KV_F("pos_jerk",  pos_max_jerk,       PT_F32),
@@ -105,6 +107,8 @@ static const kv_field_t s_fields[] = {
   KV_F("thr_ospd",  thr.overspeed_rpm,  PT_F32),
   KV_F("can_id",    can_id,             PT_U8),
   KV_F("can_wdog",  can_wdog_ms,        PT_U16),
+  KV_F("mit_kt",    mit_kt,             PT_F32),
+  KV_F("mit_clim",  mit_cur_lim,        PT_F32),
 };
 #define KV_FIELD_COUNT (sizeof(s_fields) / sizeof(s_fields[0]))
 
@@ -194,6 +198,10 @@ static void params_from_motor(params_t *p, const motor_t *m) {
   p->spd_kp          = m->ctrl.speed.kp;
   p->spd_ki          = m->ctrl.speed.ki;
   p->spd_limit       = m->ctrl.speed.out_max;
+  p->spd_accel       = m->spd_accel;
+  p->regen_margin    = m->regen_margin;
+  p->mit_kt          = m->mit_kt;
+  p->mit_cur_lim     = m->mit_cur_lim;
   p->pos_max_rpm     = m->ctrl.pos.max_rpm;
   p->pos_max_accel   = m->ctrl.pos.max_accel;
   p->pos_max_jerk    = m->ctrl.pos.max_jerk;
@@ -212,6 +220,23 @@ static void params_to_motor(const params_t *p, motor_t *m) {
   foc_set_pid_gains(m, FOC_GAIN_SPEED, p->spd_kp, p->spd_ki);
   foc_set_limit(m, FOC_LIMIT_CURRENT,  p->cur_limit);
   foc_set_limit(m, FOC_LIMIT_SPEED,    p->spd_limit);
+
+  m->spd_accel     = p->spd_accel;
+  m->regen_margin  = p->regen_margin;
+
+  /* MIT torque constant: use the user-set value, else derive from the
+   * identified flux (Kt = 1.5 * pole_pairs * flux). foc_set_state re-derives
+   * this on every MIT entry too, so the value here mainly matters for a
+   * `set mit_kt X` while the motor is already in MIT mode. */
+  m->mit_kt = p->mit_kt;
+  m->mit_cur_lim = p->mit_cur_lim;
+  if (p->mit_kt > 0.0f) {
+    m->mit_effective_kt = p->mit_kt;
+  } else if (p->flux > 0.0f) {
+    m->mit_effective_kt = 1.5f * (float)HW_MOTOR_POLE_PAIRS * (p->flux * 1.0e-3f);
+  } else {
+    m->mit_effective_kt = 0.0f;
+  }
 
   m->ctrl.pos.max_rpm    = p->pos_max_rpm;
   m->ctrl.pos.max_accel  = p->pos_max_accel;

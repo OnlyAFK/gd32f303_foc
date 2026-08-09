@@ -27,7 +27,7 @@ libraries/  vendor code (CMSIS, GD32 SPL, lwrb, CMSIS-DSP, letter-shell, flashdb
 |--------|-------|----------------|
 | `pid`, `pll`, `svpwm`, `filter`, `foc_math` | foc | Pure leaf math; depend only on `foc_math`/CMSIS-DSP |
 | `motor_hw` | foc | **HAL** — the *only* module that includes `driver/*` and bsp chip headers |
-| `foc_core` | foc | FOC state machine, cascaded loops |
+| `foc_core` | foc | FOC state machine, cascaded loops (position/speed/current) + MIT impedance mode (PD + torque FF to current loop) |
 | `foc_ident`, `foc_ltu` | foc | Commissioning sub-state machines (param ident, encoder linearization); per-tick hooks from `foc_core`, big buffers as module-private statics, blob persistence via `params` |
 | `fault` | foc | Protection + error handling; consumes `motor_hw` only. Tunable thresholds live in `fault_cfg_t` (`fault_set_cfg`/`_get_cfg`), guarded/clamped to `*_HARD_*` limits |
 | `interrupt` | foc | ISR entry points / control-loop scheduling |
@@ -80,12 +80,17 @@ Any non-empty result from 2–4 is a layering leak to fix.
 
 ## Known debts
 
-- **`foc_core.c` (~700 lines)**: hosts the cascaded control loops. The
-  parameter-identification sub-state-machines (Rs/Ld/Lq/flux electrical +
-  J/B/Tc mechanical) have been split into `foc/foc_ident`, and encoder
-  linearization into `foc/foc_ltu`;
-  `foc_core` calls their per-tick hooks from the control ISR. No longer a
-  split candidate on its own.
+- **`foc_core.c` (~910 lines)**: hosts the cascaded control loops plus the MIT
+  impedance block. The parameter-identification sub-state-machines (Rs/Ld/Lq/
+  flux electrical + J/B/Tc mechanical) have been split into `foc/foc_ident`,
+  and encoder linearization into `foc/foc_ltu`; `foc_core` calls their per-tick
+  hooks from the control ISR. Grown back past the ~600-line split threshold —
+  if it keeps growing, consider moving the MIT impedance block (PD law + clamp
+  + regen limiting) into its own `foc/foc_mit` module.
+- **`shell_port.c` (~830 lines)**: the letter-shell glue + command table. The
+  command implementations (ident/autocal/tune family alone is ~150 lines) are
+  the bulk; split the tuning/commissioning commands into a separate module when
+  the next command lands.
 - **Telemetry coupling**: `vofa` lives in `foc/` and `foc_core` *pushes* to it
   each control cycle (control → telemetry inversion). Invert to a registered
   callback / pull model and move to a service dir when telemetry is reworked.

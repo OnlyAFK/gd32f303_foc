@@ -60,12 +60,20 @@ typedef struct {
   float   friction_tc;       /* Coulomb friction [mNm] (1e3*Nm) */
   uint8_t mech_valid;        /* 1 once J/B/Tc have been identified */
 
+  /* --- speed slew ramp + regen current limiting --- */
+  float   spd_accel;         /* speed slew rate [rpm/s]; 0 = instant step */
+  float   regen_margin;      /* V margin below OV trip to begin regen limiting */
+
   /* --- protection thresholds (VESC-style guard lives in fault.c) --- */
   fault_cfg_t thr;
 
   /* --- CAN protocol layer (app/can_proto) --- */
   uint8_t  can_id;           /* this node's CAN address, 1..63 (ID = node<<5 | cmd) */
   uint16_t can_wdog_ms;      /* command-loss watchdog [ms]; 0 = disabled (default) */
+
+  /* --- MIT impedance control --- */
+  float mit_kt;              /* torque constant [Nm/A]; 0 = auto-derive from flux */
+  float mit_cur_lim;         /* MIT torque-current ceiling [A]; 0 = follow cur_limit */
 } params_t;
 
 /* Mount the KVDB, load stored values over the foc_init() defaults, and push the

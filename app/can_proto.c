@@ -59,6 +59,36 @@ static void wr_u32(uint8_t *p, uint32_t v) {
   p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
+/* --- MIT Mini Cheetah impedance frame (CAN_CMD_MIT_CONTROL) ---
+ * The 8-byte frame packs 5 quantized values (see can_proto.h for the field
+ * doc). Scales match the canonical Mini Cheetah servo firmware. */
+
+#define MIT_POS_SCALE  (FOC_2PI / 65536.0f)   /* rad/bit, [0, 2pi) mech */
+#define MIT_VEL_SCALE  0.03f                   /* rad/s per bit, +/-61.44 */
+#define MIT_KP_SCALE   0.122f                  /* Nm/rad per bit, 0..499.7 */
+#define MIT_KD_SCALE   0.024f                  /* Nm*s/rad per bit, 0..98.3 */
+#define MIT_TAU_SCALE  0.00441f                /* Nm per bit, +/-9.03 */
+
+/* Unpack one Mini Cheetah 8-byte impedance frame. pos/kp/kd are unsigned,
+ * vel/tau are 12-bit two's-complement (sign-extended here). */
+static void mit_decode(const uint8_t *d,
+                       float *pos, float *vel, float *kp, float *kd, float *tau) {
+  uint16_t p_raw  = ((uint16_t)d[0] << 8) | d[1];
+  int16_t  v_raw  = (int16_t)(((uint16_t)d[2] << 4) | ((uint16_t)d[3] >> 4));
+  uint16_t kp_raw = ((uint16_t)(d[3] & 0x0Fu) << 8) | d[4];
+  uint16_t kd_raw = ((uint16_t)d[5] << 4) | ((uint16_t)d[6] >> 4);
+  int16_t  t_raw  = (int16_t)(((uint16_t)(d[6] & 0x0Fu) << 8) | d[7]);
+
+  if (v_raw & 0x0800) v_raw |= (int16_t)0xF000;  /* sign-extend 12-bit */
+  if (t_raw & 0x0800) t_raw |= (int16_t)0xF000;
+
+  *pos = (float)p_raw  * MIT_POS_SCALE;
+  *vel = (float)v_raw  * MIT_VEL_SCALE;
+  *kp  = (float)kp_raw * MIT_KP_SCALE;
+  *kd  = (float)kd_raw * MIT_KD_SCALE;
+  *tau = (float)t_raw  * MIT_TAU_SCALE;
+}
+
 /* Map the protocol mode byte onto a foc_set_state call, clearing that mode's
  * setpoint first so the motor does not lurch on a stale target (mirrors the
  * shell `mode` command). Unknown mode -> ignored. */
@@ -86,6 +116,9 @@ static void apply_mode(uint8_t mode) {
     foc_set_voltage(s_motor, 0.0f, 0.0f);
     foc_set_openloop_speed(s_motor, 0.0f);
     foc_set_state(s_motor, FOC_STATE_OPENLOOP_VOLT);
+    break;
+  case CAN_MODE_MIT:
+    foc_set_state(s_motor, FOC_STATE_MIT);
     break;
   default:
     return;   /* unknown mode: ignore entirely (watchdog arming untouched) */
@@ -146,9 +179,21 @@ static uint8_t dispatch(const can_frame_t *f) {
     break;
 
   case CAN_CMD_MIT_CONTROL:
-    /* Reserved for impedance control; not implemented yet. Count it as unknown
-     * so the host can tell it was not acted on. */
-    return 0u;
+    if (f->dlc >= 8u) {
+      float pos, vel, kp, kd, tau;
+      mit_decode(f->data, &pos, &vel, &kp, &kd, &tau);
+      /* Enter MIT mode first: foc_set_state resets mit_cmd.active (soft start),
+       * so the new command must be written afterwards. If Kt is unavailable the
+       * state diverts to IDLE and this frame simply has no effect until mit_kt
+       * / flux are provided. */
+      if (foc_get_state(s_motor) != FOC_STATE_MIT) {
+        foc_set_state(s_motor, FOC_STATE_MIT);
+      }
+      foc_set_mit_command(s_motor, pos, vel, kp, kd, tau);
+      /* MIT frames refresh the command watchdog like any other driving mode. */
+      s_can_drive = 1u;
+    }
+    break;
 
   default:
     return 0u;   /* unrecognised cmd_id */

@@ -106,6 +106,7 @@ static const char *state_name(foc_state_t s) {
   case FOC_STATE_CURRENT:         return "CURRENT";
   case FOC_STATE_SPEED:           return "SPEED";
   case FOC_STATE_POSITION:        return "POSITION";
+  case FOC_STATE_MIT:             return "MIT";
   case FOC_STATE_IDENT:           return "IDENT";
   case FOC_STATE_IMECH:           return "IMECH";
   case FOC_STATE_LTU:             return "LTU";
@@ -119,7 +120,7 @@ static const char *state_name(foc_state_t s) {
 static int cmd_mode(int argc, char *argv[]) {
   if (argc < 2) {
     shellPrint(&s_shell, "mode = %s\r\n", state_name(foc_get_state(s_motor)));
-    shellWriteString(&s_shell, "usage: mode <idle|current|speed|position|volt|openloop>\r\n");
+    shellWriteString(&s_shell, "usage: mode <idle|current|speed|position|volt|openloop|mit>\r\n");
     return 0;
   }
   const char *m = argv[1];
@@ -142,6 +143,8 @@ static int cmd_mode(int argc, char *argv[]) {
     foc_set_voltage(s_motor, 0.0f, 0.0f);
     foc_set_openloop_speed(s_motor, 0.0f);
     foc_set_state(s_motor, FOC_STATE_OPENLOOP_VOLT);
+  } else if (strcmp(m, "mit") == 0) {
+    foc_set_state(s_motor, FOC_STATE_MIT);   /* holds present angle; setpoints via CAN */
   } else {
     shellWriteString(&s_shell, "unknown mode\r\n");
     return 0;
@@ -192,6 +195,33 @@ static int cmd_volt(int argc, char *argv[]) {
   }
   print_f("vd", s_motor->target.vd);
   print_f("vq", s_motor->target.vq);
+  return 0;
+}
+
+// MIT impedance control debug front-end (the real setpoint path is CAN, but
+// this lets the shell send/echo a command for bench testing).
+//   mit <pos_deg> <vel_rps> <kp_Nm_rad> <kd_Nm_s_rad> <tau_Nm>
+// With no args it just echoes the current MIT state.
+static int cmd_mit(int argc, char *argv[]) {
+  if (argc >= 6) {
+    float pos = arg_f(argv[1]) * DEG_TO_RAD;
+    float vel = arg_f(argv[2]);
+    float kp  = arg_f(argv[3]);
+    float kd  = arg_f(argv[4]);
+    float tau = arg_f(argv[5]);
+    if (foc_get_state(s_motor) != FOC_STATE_MIT) {
+      foc_set_state(s_motor, FOC_STATE_MIT);
+    }
+    foc_set_mit_command(s_motor, pos, vel, kp, kd, tau);
+  }
+  shellPrint(&s_shell, "MIT active=%d\r\n", (int)s_motor->mit_cmd.active);
+  print_f("mit_pos_ref_deg", s_motor->mit_cmd.pos_ref * RAD_TO_DEG);
+  print_f("mit_vel_ref_rps", s_motor->mit_cmd.vel_ref);
+  print_f("mit_kp_Nm_rad",   s_motor->mit_cmd.kp);
+  print_f("mit_kd_Nm_s_rad", s_motor->mit_cmd.kd);
+  print_f("mit_tau_Nm",      s_motor->mit_cmd.tau_ff);
+  print_f("mit_kt_Nm_A",     s_motor->mit_effective_kt);
+  print_f("pos_deg",         s_motor->actual.pos * RAD_TO_DEG);
   return 0;
 }
 
@@ -737,6 +767,7 @@ const ShellCommand shellCommandList[] = {
   SHELL_CMD_ITEM(CMD_ATTR, id, cmd_id, set/show d-axis current (A)),
   SHELL_CMD_ITEM(CMD_ATTR, iq, cmd_iq, set/show q-axis current (A)),
   SHELL_CMD_ITEM(CMD_ATTR, pos, cmd_pos, set/show position target (DEGREES)),
+  SHELL_CMD_ITEM(CMD_ATTR, mit, cmd_mit, MIT impedance: mit [pos_deg vel_rps kp kd tau_Nm]),
   SHELL_CMD_ITEM(CMD_ATTR, volt, cmd_volt, set voltage: volt <vd> <vq>),
   SHELL_CMD_ITEM(CMD_ATTR, autocal, cmd_autocal, full auto-calibration: align+ident+deploy (rotor moves/spins)),
   SHELL_CMD_ITEM(CMD_ATTR, identinfo, cmd_identinfo, show raw measurements of the last autocal run),

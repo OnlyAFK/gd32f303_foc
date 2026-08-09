@@ -234,7 +234,11 @@ int main(void) {
         fault_monitor_slow(motor_hw_get_vbus(),
                            g_motor.actual.iq, g_motor.target.iq, g_motor.actual.rpm,
                            g_motor.sensor.currents.iu, g_motor.sensor.currents.iv,
-                           driving != 0u, tick_ms);
+                           driving != 0u,
+                           /* stall_en: MIT is force control — holding a blocked
+                            * rotor is a legal operating point, not a fault. */
+                           foc_get_state(&g_motor) != FOC_STATE_MIT,
+                           tick_ms);
 
         // If a protection fired, latch the control state machine into ERROR and
         // persist the fault snapshot (outputs are now off, so the flash write is

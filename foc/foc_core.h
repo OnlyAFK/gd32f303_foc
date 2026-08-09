@@ -28,6 +28,7 @@ typedef enum {
   FOC_STATE_CURRENT,         /* id/iq current loop */
   FOC_STATE_SPEED,           /* speed loop -> current loop */
   FOC_STATE_POSITION,        /* position loop -> speed -> current loop */
+  FOC_STATE_MIT,             /* MIT impedance control: PD + torque FF -> current loop */
   FOC_STATE_IDENT,           /* electrical identification (Rs/Ld/Lq/flux) */
   FOC_STATE_IMECH,           /* mechanical identification (J/B/Tc), spins rotor */
   FOC_STATE_LTU,             /* encoder linearization calibration (open-loop sweep) */
@@ -116,6 +117,20 @@ typedef struct {
   float vq;       /* applied q-axis voltage (current-loop output) */
 } motor_actual_t;
 
+/* MIT impedance-control command (Mini Cheetah style). Received via CAN as a
+ * single 8-byte frame and consumed by the 20 kHz current-loop block: the PD
+ * torque (tau_ff + kp*pos_err + kd*vel_err) is converted to iq by Kt. `active`
+ * is cleared on mode entry and set by the first command frame, so the motor
+ * holds zero torque until a setpoint actually arrives (soft start). */
+typedef struct {
+  float pos_ref;      /* desired mechanical position [rad], single-turn [0, 2pi) */
+  float vel_ref;      /* desired mechanical velocity [rad/s] */
+  float kp;           /* position stiffness [Nm/rad] */
+  float kd;           /* velocity damping [Nm*s/rad] */
+  float tau_ff;       /* torque feed-forward [Nm] */
+  uint8_t active;     /* 1 once a valid MIT command has been received */
+} mit_cmd_t;
+
 struct motor_s {
   foc_state_t state;
 
@@ -125,11 +140,20 @@ struct motor_s {
   motor_target_t target;
   motor_actual_t actual;
 
+  mit_cmd_t mit_cmd;          /* live MIT impedance command (written by CAN) */
+  float     mit_kt;           /* user-specified torque constant [Nm/A]; 0 = auto from flux */
+  float     mit_effective_kt; /* actual Kt used by the ISR [Nm/A]; 0 = unavailable */
+  float     mit_cur_lim;      /* MIT torque-current ceiling [A]; 0 = follow cur_limit */
+
   cali_ctx_t cali;
   ident_ctx_t ident;
   imech_ctx_t imech;
   ltu_ctx_t ltu;
   float openloop_angle;   /* electrical angle for FOC_STATE_OPENLOOP_VOLT */
+
+  float spd_cmd_rpm;      /* user-commanded speed setpoint (before slew ramp) */
+  float spd_accel;        /* speed slew rate [rpm/s]; 0 = instant (backward compatible) */
+  float regen_margin;     /* V margin below ov_trip to begin regen limiting */
 
   float vdc;
   uint32_t pwm_period;
@@ -158,6 +182,11 @@ void foc_set_openloop_speed(motor_t *motor, float rpm);
 void foc_set_target_current(motor_t *motor, float id, float iq);
 void foc_set_target_speed(motor_t *motor, float rpm);
 void foc_set_target_position(motor_t *motor, float pos_rad);
+
+/* MIT impedance control: update the 5 command parameters atomically (IRQ-safe).
+ * If the motor is not yet in FOC_STATE_MIT, the caller must transition first. */
+void foc_set_mit_command(motor_t *motor, float pos_ref, float vel_ref,
+                         float kp, float kd, float tau_ff);
 
 /* Live tuning (used by the shell). Selectors for the gain/limit setters. */
 typedef enum { FOC_GAIN_ID = 0, FOC_GAIN_IQ, FOC_GAIN_SPEED } foc_gain_sel_t;

@@ -19,6 +19,198 @@ Entry template:
 
 ---
 
+## MIT: independent torque-current limit (mit_cur_lim) — 2026-08-09
+### What
+- New persistent param `mit_cur_lim` [A] (default 5, same as `spd_limit`;
+  `0` = follow `cur_limit`). The MIT front-end clamps `iq` to
+  `min(cur_limit, mit_cur_lim)` instead of `cur_limit` alone.
+- Version bumped 0.2.16 -> 0.2.17 (PATCH: param added, stored params kept).
+### Why
+- Bench: MIT with `kp=0.3` / `kd=0.1` tripped `FAULT_DRV_UVLO` (FS1=0x080, VM
+  undervoltage latch, threshold ~5.6 V) whenever the PD demand saturated the
+  12 A clamp. 12 A × 24 V ≈ 288 W collapses a bench-supply rail during a
+  stalled / large-error demand, dropping VM below the UVLO threshold. SPEED /
+  POSITION never saw this because their iq is capped at `spd_limit` (5 A).
+- `cur_limit` cannot simply be lowered for MIT: it doubles as the current-loop
+  PI voltage-output bound, so a low value would starve the motor of voltage at
+  speed. MIT needs its own current ceiling.
+### How to use
+- `set mit_clim <A>` / `get mit_clim` / `save`. Verify: `mit 30 0 0.5 0.02 0`
+  then a large setpoint step — `iq_ref` saturates at ±5 A and no `DRV_UVLO`.
+- Raise to 8-10 A only if the supply can deliver the power (check bench-supply
+  current limit; 12 A needs ~288 W).
+### Notes / follow-ups
+- `mit_cur_lim` values above `cur_limit` are capped by `cur_limit` (min()).
+- If UVLO still appears at 5 A, check the VM supply path / power source
+  hardware rather than the current command.
+
+---
+
+## MIT: exempt stall detection (blocked-rotor hold) — 2026-08-09
+### What
+- `fault_monitor_slow()` gains a `stall_en` gate: the stall detector now also
+  requires `stall_en` (in addition to `driving`).
+- `main.c` passes `foc_get_state() != FOC_STATE_MIT`, so MIT disables the stall
+  detector. I²t / bus / overspeed / phase-loss / encoder protection are
+  unchanged and still cover sustained overload.
+### Why
+- MIT is force control: holding a blocked rotor at constant torque (gripping /
+  load holding) is a legal operating point. With the 12 A current clamp from
+  the earlier fix, a blocked-rotor hold trips `FAULT_STALL` after ~1 s
+  (`stall_iq` 9 A) — a false positive that interrupts impedance-control tasks.
+- Matches the reference implementations (ODrive / SimpleFOC / MIT Mini
+  Cheetah): none of them has a stall detector; overload protection is I²t /
+  thermal, and task-level safety lives in the host.
+### How to use
+- None — automatic per mode. In MIT a sustained blocked-rotor hold no longer
+  latches `FAULT_STALL`; `FAULT_OVERLOAD_I2T` still trips if the I²t energy
+  budget is exceeded.
+### Notes / follow-ups
+- The stall detector stays active in CURRENT/SPEED/POSITION (unchanged).
+- If a future force-control mode besides MIT is added, extend the same gate.
+
+---
+
+## MIT: clamp torque current to cur_limit (overcurrent fix) — 2026-08-09
+### What
+- **MIT `iq_cmd` is now clamped to ±`cur_limit` (A) before it reaches the
+  current-loop PI** — the PD demand `(tau_ff + kp·Δpos + kd·Δvel)/Kt` was fed
+  through unclamped, and the old "the PI clamps the current to cur_limit"
+  comment was wrong: the PI's `out_max` is a *voltage* output clamp and cannot
+  stop the phase current from running past `FAULT_OC_SW_PEAK` (14 A) while
+  tracking a huge reference.
+- **`target.iq` now holds the final value** (after clamp + regen limiting) so
+  telemetry and the slow fault monitor (phase-loss arming on `iq_cmd`) see what
+  the current loop actually tracked; previously it exposed the raw pre-limit
+  demand.
+### Why
+- Bench: MIT tripped `FAULT_OVERCURRENT_SW` easily. With Kt ≈ 0.025 Nm/A on
+  this unit, a 0.5 rad error at `kp=0.5` already demands ~10 A and a half-turn
+  error demands 60+ A; the PI then saturated its 12 V voltage output and the
+  phase current climbed at ~76 A/ms until the 14 A software trip latched the
+  driver off.
+- The reference implementations (ODrive, SimpleFOC, MIT Mini Cheetah motor
+  board) all bound the torque/current command at the current-loop front-end —
+  this closes the same gap.
+### How to use
+- No new parameter: the clamp is `cur_limit` (same value the current-loop PI
+  uses as its output bound); `set cur_lim <A>` tunes it. Verify with
+  `mit 30 0 0.5 0.02 0` then a large setpoint step: the torque current
+  saturates at `cur_lim` instead of tripping the 14 A software overcurrent.
+### Notes / follow-ups
+- `cur_limit` carries double duty — current limit [A] AND current-loop PI
+  voltage-output bound [V] — both semantics see the same value today; a future
+  cleanup could split them.
+- Clamping to 12 A still sits above `FAULT_STALL_IQ` (9 A): a sustained
+  blocked-rotor hold in MIT (a legal impedance-control operating point) can
+  still trip `FAULT_STALL` after ~1 s and I²t after ~1.6 s. ODrive / SimpleFOC /
+  MIT have no stall detector at all — they rely on current clamp + I²t/thermal
+  + host-side E-stop. Decide whether MIT should exempt the stall detector.
+
+---
+
+## MIT impedance control (CAN) — 2026-08-02
+### What
+- **New `FOC_STATE_MIT`** — Mini Cheetah-style impedance control: the current
+  loop tracks `iq = (tau_ff + kp·(pos_ref−pos) + kd·(vel_ref−vel)) / Kt`, with
+  the PD evaluated every 20 kHz tick (the damping term therefore uses the full
+  PLL velocity bandwidth). The position reference is single-turn `[0, 2π)`
+  from CAN, unwrapped against the continuous multi-turn encoder tracker
+  (`ctrl.pos.current_pos`) so the error wraps to `[-π, π]` correctly regardless
+  of accumulated turns.
+- **CAN `0x10 MIT_CONTROL` implemented** (previously a NACK stub) — the
+  canonical Mini Cheetah 8-byte frame: `pos` 16 b, `vel` 12 b (signed),
+  `kp` 12 b, `kd` 12 b, `tau_ff` 12 b (signed), quantized with the canonical
+  Mini Cheetah scales. The first MIT frame also enters MIT mode;
+  `CAN_MODE_MIT` (6) added to the SET_MODE enum.
+- **Torque constant `mit_kt`** — new persistent param (Nm/A); `0` = auto-derive
+  from the identified flux (`Kt = 1.5·pole_pairs·flux`). MIT mode refuses to
+  enter when neither is available, diverting to IDLE (not ERROR) so the user
+  can still `set mit_kt` / run `autocal`.
+- **Soft start** — entering MIT holds the present angle with zero torque until
+  the first command frame arrives (`mit_cmd.active`), so a stale/warmed-up CAN
+  bus cannot lurch the motor on mode entry.
+- **Safety** — MIT iq is clamped to `cur_lim` before the current-loop PI (the
+  PI's own `out_max` is only a voltage output clamp — see the 2026-08-09 fix);
+  regen current limiting applies; the CAN command watchdog (`s_can_drive`)
+  arms on MIT frames exactly like other driving modes, so a lost host still
+  stops the motor.
+- Shell: `mode mit` plus a `mit [pos_deg vel_rps kp kd tau_Nm]` debug command;
+  `status` shows `MIT`. Stored params preserved (PATCH bump).
+- Version bumped 0.2.15 -> 0.2.16 (PATCH: `mit_kt` param added, stored params kept).
+### Why
+- The CAN protocol already reserved `0x10` for impedance control; this delivers
+  it. Impedance (PD + feed-forward) is the standard interface for force/torque
+  controlled joints and teleop, letting a host command stiffness/damping online
+  per-frame rather than pre-configuring them.
+### How to use
+- **CAN host**: after `SET_MODE` with mode 6, send `0x10` frames at the control
+  rate. Frame layout (see `can_proto.h` doc) packs `pos/vel/kp/kd/tau_ff`. The
+  first frame transitions the motor into MIT mode on its own.
+- **Shell bench test**: `mit 30 0 0.5 0.02 0` — holds 30°, stiffness 0.5 Nm/rad,
+  damping 0.02 Nm·s/rad. Push the rotor and feel the spring.
+- **Setup**: MIT needs a torque constant. After `autocal`, flux is identified
+  and Kt derives automatically; otherwise `set mit_kt <Nm/A>`. `mode mit` shows
+  `mit_kt` via `status`/`mit`.
+### Notes / follow-ups
+- Kt is resolved on every MIT entry (and re-pushed by `set mit_kt X` via
+  `params_to_motor`). A Kt change mid-flight only applies on the next entry.
+- The pos reference is single-turn; for multi-turn tracking the host must re-wrap
+  its commanded angle so the error stays within one turn (standard MIT behavior).
+
+---
+
+## Speed slew-rate limit + regen current limiting — 2026-08-02
+### What
+- **Speed slew-rate limit (`spd_acc`)** — `speed <rpm>` setpoints no longer step
+  the target instantly; `target.rpm` now ramps toward the command at
+  `spd_accel` rpm/s (default `3000` rpm/s; `0` = instant). Implemented in the
+  1 kHz speed-loop block in `foc_core.c`; `foc_set_target_speed()` stores the
+  raw command in a new `motor->spd_cmd_rpm` and the ramp advances
+  `motor->target.rpm` each tick. POSITION mode is untouched — it keeps its own
+  jerk-limited profiler.
+- **SPEED-mode entry zeroes the ramp state** — `foc_set_state(FOC_STATE_SPEED)`
+  now clears both `target.rpm` and `spd_cmd_rpm` on entry. Without this, a
+  `stop` followed by `mode speed` resumed the slew from the leftover `target.rpm`
+  (e.g. 2000), so the speed loop saw a stale 2000 rpm reference against a parked
+  rotor and lurched the motor forward on mode entry.
+- **Regen current limiting (`regen_mrg`)** — when Vbus rises within
+  `regen_margin` (default 4 V) of the OV trip, the regenerative (braking)
+  component of the iq command is scaled down linearly, reaching zero at the trip
+  threshold, so the rail cannot kick through `FAULT_BUS_OV`. Only the direction
+  opposing rotation (`iq * rpm < 0`) is limited; motoring is untouched. Applied
+  in the 20 kHz current-loop path for CURRENT/SPEED/POSITION modes via a local
+  `iq_cmd` copy (never destructively mutates `target.iq`).
+- New persistent params `spd_acc` (rpm/s) and `regen_mrg` (V), stored in the
+  KVDB via the standard field-table (`get`/`set`/`save`/`factory` all work).
+- Version bumped 0.2.14 -> 0.2.15 (PATCH: params added, stored params kept).
+### Why
+- `speed 2000` then `speed -2000` commanded a full -5 A reverse-brake from a
+  2000 rpm spin; the regenerated energy pumped the 24 V bus past 30 V and
+  latched `FAULT_BUS_OV` (0x00100). The bench supply cannot sink feedback
+  current and there is no brake-resistor space in this joint module, so the
+  fix has to be in software: rate-limit the speed command and soft-limit the
+  regen current against the measured bus voltage.
+### How to use
+- `spd_acc` default is `3000` rpm/s (a `speed 2000` step lands in ~0.7 s, a
+  2000 -> -2000 reversal in ~1.3 s). `set spd_acc 1000` for gentler ramps,
+  `set spd_acc 0` for instant stepping. Then `speed 2000` -> `speed -2000`
+  should no longer trip `FAULT_BUS_OV`; watch `status` vbus pinned in the
+  27-29 V band during the reversal.
+- `set regen_mrg 6` — start regen limiting 6 V below the trip (earlier/softer
+  braking); `set regen_mrg 0` disables the limiting (not recommended).
+- Verify: `status` shows the ramped `speed_ref_rpm` (matches what the speed PI
+  sees); repeated forward/reverse reversals stay fault-free.
+### Notes / follow-ups
+- The ramp bounds only the instantaneous regen *rate*; the total energy in a
+  reversal is fixed, so a very large inertia or a very small `spd_acc` can still
+  saturate the bus. If a longer/deeper braking profile is ever needed, pair
+  `spd_acc` with a lower `regen_mrg` or add a decel-only ramp.
+- `fault_check_fast` still hard-trips at `vbus_ov_trip`; the regen limiter only
+  keeps the rail from *reaching* it in normal use.
+
+---
+
 ## Cogging-torque compensation REMOVED (feature parked) — 2026-08-01
 ### What
 - **All cogging-torque compensation code removed**: `foc/foc_cogging.*` and
