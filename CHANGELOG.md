@@ -19,6 +19,50 @@ Entry template:
 
 ---
 
+## Control hardening for voltage-limited high-speed operation — 2026-08-19
+### What
+- `pi_calc()` gains conditional-integration anti-windup: the integrator freezes
+  while the output is saturated and the error keeps pushing further into
+  saturation, and resumes when the error reverses or the output leaves
+  saturation.
+- `foc_set_pid_gains()` clamps negative kp/ki to 0 — no path (not even a
+  stored flash value loaded at boot) can deploy a positive-feedback gain.
+- `params_tune_speed_loop()` clamps a negative identified-B Ki to 0 and
+  documents the guard.
+- IMECH rewritten: J via pure coast-down (spin up to ~500 rpm with +Iq, cut
+  current, time the free coast 400 -> 200 rpm) instead of bidirectional
+  accel/decel; B/Tc via steady-state speed steps 200..500 rpm held by a
+  conservative local speed PI. New `friction_valid` flag: a physically
+  impossible (negative) B/Tc fit clamps to 0 and `identinfo` prints a warning.
+- Phase-loss detector now also requires a stopped rotor
+  (`FAULT_PHASELOSS_RPM` = 100 rpm): at high RPM a voltage-saturated drive
+  legitimately measures near-zero phase current, which is not an open phase.
+- New `FEATURE_BACKLOG.md` tracks the pending feature/engineering list.
+- Version bumped 0.2.17 -> 0.2.18.
+### Why
+- Bench on the new motor at the voltage-limited operating point (speed command
+  beyond what the bus can deliver): the speed loop saturated at 5 A while iq
+  stayed ~0.1 A, and the near-zero phase current tripped the phase-loss
+  detector; the PI integrator wound up holding a max-torque command forever.
+- The old bidirectional IMECH method produced unreliable B/Tc on this motor
+  (fits could go negative); a negative Ki deploys positive feedback and turns
+  the speed loop into a destabilising loop.
+### How to use
+- Re-run `autocal` after flashing; IMECH now reports
+  `friction NOT TRUSTED` in `identinfo` when the B/Tc fit is negative — re-run
+  in that case.
+- Phase-loss behaviour below 100 rpm is unchanged: unplug a phase at
+  standstill with torque commanded, expect a fault within ~500 ms; a high-speed
+  run must no longer false-trip.
+### Notes / follow-ups
+- The voltage-limited ceiling (~1100 rpm at the 12 V current-loop clamp,
+  ~1600 rpm with the clamp released on a 29 V bus) is motor-hardware bound;
+  flux weakening is tracked in FEATURE_BACKLOG 5.2.
+- FEATURE_BACKLOG 2.1 / 2.2 (accel+friction feed-forward, dq decoupling)
+  remain the top P0 candidates to deploy the now-identified J/B/Tc/flux.
+
+---
+
 ## MIT: independent torque-current limit (mit_cur_lim) — 2026-08-09
 ### What
 - New persistent param `mit_cur_lim` [A] (default 5, same as `spd_limit`;

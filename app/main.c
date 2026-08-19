@@ -21,7 +21,7 @@ static motor_t g_motor;
  * are captured by the edge logic in the main loop; gains are deployed here.
  * =================================================================== */
 #define AUTOCAL_SETTLE_MS   1000u    /* inter-stage settle (cross-talk guard) */
-#define AUTOCAL_IMECH_IQ    1.0f     /* J/B test current */
+#define AUTOCAL_IMECH_IQ    1.0f     /* J accel/brake test current */
 #define AUTOCAL_CUR_BW_HZ   1000.0f  /* current-loop bandwidth */
 #define AUTOCAL_SPD_BW_HZ   10.0f    /* speed-loop bandwidth */
 #define AUTOCAL_LTU_CURRENT 3.0f     /* LTU open-loop drag current (sizes the

@@ -77,32 +77,67 @@ typedef struct {
   float flux;             /* PM flux linkage [mWb] (1e3*Wb, for clean display) */
 } ident_ctx_t;
 
-/* Mechanical identification (FOC_STATE_IMECH): bidirectional torque accel/decel
- * across a set of speed gates, all in current (torque) mode reading the speed
- * feedback. Per band:  J = 2*Te/(a_up + a_dn)  (friction cancels), and the
- * friction torque  f = J*(a_dn - a_up)/2  is fit across bands -> B, Tc. */
-#define IMECH_N_GATES 6u
+/* Mechanical identification (FOC_STATE_IMECH), two independent measurements:
+ *
+ *  J (rotor inertia): COAST-DOWN method.
+ *    +Iq spins the rotor to ~500 rpm, then iq is cut and the rotor free-coasts
+ *    through 400 -> 200 rpm. With zero current  J*a = f(w) = B*w + Tc, so with
+ *    B/Tc known from the steady-state steps  J = f(w_mid) * dt / dw. No current
+ *    reversal, no sign flip, and the PLL's constant acceleration lag cancels
+ *    in the time difference of a steady coast — immune to everything that
+ *    broke the old gate-timestamp / bidirectional methods on this motor.
+ *
+ *  B/Tc (viscous + Coulomb friction): steady-state SPEED-STEP method.
+ *    A conservative local PI speed loop settles the rotor at 200/300/400/500
+ *    rpm; at steady state  Kt*iq = f(w) = B*w + Tc, so the measured (w, iq)
+ *    pairs are least-squares fit -> B (slope), Tc (intercept). Purely
+ *    steady-state averages -> immune to current-reversal transients, PLL
+ *    dynamics and encoder quantisation by construction.
+ */
+#define IMECH_SPD_N_TARGETS 4u
 typedef enum {
-  IMECH_ACCEL = 0,   /* +Iq: ramp up, timestamp each gate crossing */
-  IMECH_DECEL,       /* -Iq: ramp down, timestamp each gate crossing -> compute */
+  IMECH_J_UP = 0,    /* +Iq: spin up to IMECH_J_TOP (J coast start) */
+  IMECH_J_COAST,     /* Iq=0: time 400 -> 200 rpm (J; B/Tc fitted later) */
+  IMECH_SPD_STEP,    /* steady-state speed steps 200..500 rpm (B/Tc) */
   IMECH_DONE,
 } imech_phase_t;
 
 typedef struct {
   imech_phase_t phase;
   float    kt;            /* torque constant Kt = 1.5*p*flux [Nm/A] (passed in) */
-  float    iq_test;       /* test current magnitude [A] */
-  float    iq_ref;        /* applied q-current (+iq_test / -iq_test / 0) */
+  float    iq_test;       /* constant test current for the J spin-up [A] */
+  float    iq_ref;        /* applied q-current (constant or local speed-PI out) */
   uint32_t tick;          /* free-running tick counter (timestamps) */
   uint32_t timeout;       /* per-phase watchdog counter */
-  int32_t  idx;           /* next gate index */
-  uint32_t t_up[IMECH_N_GATES];   /* tick at each upward gate crossing */
-  uint32_t t_dn[IMECH_N_GATES];   /* tick at each downward gate crossing */
+  int32_t  idx;           /* speed-step index */
+
+  /* J: coast-down timestamps. The measured speed at each gate is stored
+   * alongside the tick so the (small) PLL lag and gate-quantisation error
+   * cancel in the dw/dt ratio. */
+  uint32_t t_j_hi;            /* +Iq: tick at IMECH_J_TOP (coast starts) */
+  uint32_t t_coast_hi, t_coast_lo;  /* coast: ticks at 400 / 200 rpm */
+  float    rpm_coast_hi, rpm_coast_lo;  /* measured rpm at those ticks */
+  uint8_t  j_hi_done, coast_hi_done;    /* crossing flags */
+  uint32_t j_settle;          /* current-rise settle at J_UP start */
+
+  /* B/Tc: steady-state speed steps */
+  float    target_rpm;             /* current target speed */
+  float    spd_kp, spd_ki, spd_int;/* conservative local speed PI (A/rpm) */
+  uint32_t settle_tick;            /* ticks into the current settle window */
+  float    sum_w, sum_iq;          /* record-window accumulators */
+  uint32_t n;                      /* samples in the accumulators */
+  float    w_pts[IMECH_SPD_N_TARGETS];  /* steady-state omega [rad/s] */
+  float    iq_pts[IMECH_SPD_N_TARGETS]; /* steady-state iq [A] */
+  uint32_t n_pts;                  /* filled points */
 
   /* Results (copied to flash params on the IMECH -> IDLE edge). */
   float j;                /* rotor-side inertia [g.cm^2] (1e7*kg.m^2) */
   float b;                /* viscous friction [uNm.s/rad] (1e6*Nm.s/rad) */
   float tc;               /* Coulomb friction [mNm] (1e3*Nm) */
+  uint8_t friction_valid; /* 1: B/Tc fit came out physically plausible (>= 0);
+                             0: a negative value was measured and clamped to 0 —
+                             the friction data (and any Ki deployed from it) is
+                             not trustworthy, see identinfo */
 } imech_ctx_t;
 
 /* Start electrical identification (Rs/Ld/Lq/flux). Requires current-offset

@@ -622,6 +622,11 @@ void foc_set_pid_gains(motor_t *motor, foc_gain_sel_t sel, float kp, float ki) {
   pid_t *p = (sel == FOC_GAIN_ID)   ? &motor->ctrl.id
            : (sel == FOC_GAIN_IQ)   ? &motor->ctrl.iq
                                     : &motor->ctrl.speed;
+  /* Safety clamp: a negative gain (e.g. a bad friction ident feeding the speed
+   * loop) turns the PI into positive feedback. Clamp to 0 so no path — not even
+   * a stored flash value loaded at boot — can deploy a destabilising gain. */
+  if (kp < 0.0f) { kp = 0.0f; }
+  if (ki < 0.0f) { ki = 0.0f; }
   p->kp = kp;
   p->ki = ki;
 }

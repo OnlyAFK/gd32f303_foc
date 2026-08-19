@@ -441,8 +441,19 @@ void params_tune_speed_loop(motor_t *motor, float bw_hz) {
   float b_si = s_params.visc_b * 1.0e-6f;
   float kt   = 1.5f * (float)HW_MOTOR_POLE_PAIRS * (s_params.flux * 1.0e-3f);
   float w_bw = 2.0f * FOC_PI * bw_hz;
-  params_set(motor, "spd_kp", (j_si * w_bw / kt) * FOC_RPM_TO_RAD);
-  params_set(motor, "spd_ki", (b_si * w_bw / kt) * FOC_RPM_TO_RAD);
+
+  /* Deployment guard: the identified B (viscous friction) must be >= 0 — a
+   * negative value is a measurement artefact (the IMECH fit can go negative on
+   * a high-acceleration motor), and a negative integral gain turns the speed
+   * loop into positive feedback. Clamp Ki to 0 in that case instead of
+   * deploying a destabilising gain; Kp is clamped defensively too. The
+   * low-level clamp in foc_set_pid_gains covers the flash-load path. */
+  float kp = (j_si * w_bw / kt) * FOC_RPM_TO_RAD;
+  if (kp < 0.0f) { kp = 0.0f; }
+  float ki = (b_si * w_bw / kt) * FOC_RPM_TO_RAD;
+  if (ki < 0.0f) { ki = 0.0f; }
+  params_set(motor, "spd_kp", kp);
+  params_set(motor, "spd_ki", ki);
 }
 
 void params_factory_reset(motor_t *motor) {

@@ -263,6 +263,11 @@ static int cmd_identinfo(int argc, char *argv[]) {
   print_f("  J_g.cm2", s_motor->imech.j);
   print_f("  B_uNm.s", s_motor->imech.b);
   print_f("  Tc_mNm", s_motor->imech.tc);
+  if (s_motor->imech.friction_valid == 0u) {
+    shellWriteString(&s_shell,
+      "  friction NOT TRUSTED: B/Tc fit was negative and was clamped to 0\r\n"
+      "  (speed-loop Ki deploys as 0; re-run autocal)\r\n");
+  }
   return 0;
 }
 

@@ -93,9 +93,15 @@ typedef enum {
 
 /* Phase loss: commanding real torque current but the measured phase currents
  * stay near zero -> open winding / disconnected motor. Gated on a meaningful
- * current command so it never trips while idle / holding a no-load position. */
+ * current command so it never trips while idle / holding a no-load position.
+ * Also gated on a stopped rotor: at high RPM a voltage-saturated drive (bus
+ * cannot push enough voltage against the back-EMF) legitimately measures
+ * near-zero phase current, which is NOT an open phase. A genuinely
+ * disconnected motor spins down to a stop, so requiring a stopped rotor keeps
+ * the detector from nuisance-tripping the voltage-limited operating point. */
 #define FAULT_PHASELOSS_IQCMD 1.0f     /* A, minimum commanded iq to arm the test */
 #define FAULT_PHASELOSS_I     0.3f     /* A, measured "near zero" */
+#define FAULT_PHASELOSS_RPM   100.0f   /* |rpm| below this counts as "rotor not turning" */
 #define FAULT_PHASELOSS_MS    500u
 
 /* Debounce windows for the 1 ms background monitor (in ms). */

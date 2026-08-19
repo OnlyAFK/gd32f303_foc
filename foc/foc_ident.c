@@ -47,16 +47,29 @@
 #define IDENT_FLUX_COAST_MIN_RPM 40.0f    /* stop fitting below this rotor rpm */
 #define IDENT_FLUX_COAST_TIMEOUT 200000u  /* ticks (~10 s) max coast */
 
-/* Mechanical identification (J/B/Tc) — bidirectional torque, current mode.
- * Speed gates are rotor mechanical rpm, all far below the ~1200 rpm rotor limit.
- * Per-band timing (time between two gate crossings) is immune to a constant PLL
- * speed lag, so reading the PLL speed is fine. */
+/* Mechanical identification (J/B/Tc) — see foc_ident.h for the method
+ * overview. J: spin up to IMECH_J_TOP with +Iq (settle guard for the current
+ * rise), cut iq, then time the free coast through [IMECH_COAST_LO, HI] rpm —
+ * J = f(w_mid)*dt/dw with f from the B/Tc fit below (computed in
+ * imech_compute). B/Tc: steady-state speed steps at imech_spd_targets_rpm[];
+ * a conservative local PI speed loop holds each target and the tail of the
+ * settle window is averaged into (w, iq) — steady-state fit Kt*iq = B*w + Tc.
+ * All speeds are far below the ~1200 rpm rotor / ~1000 rpm abort limit. */
+#define IMECH_J_TOP             500.0f    /* spin-up target before coasting */
+#define IMECH_COAST_HI          400.0f    /* coast timing window [rpm] */
+#define IMECH_COAST_LO          200.0f
+#define IMECH_J_START_SETTLE_TICKS 20u    /* ~1 ms current rise before timing */
 #define IMECH_ACCEL_TIMEOUT     80000u    /* ticks (~4 s) max spin-up */
-#define IMECH_DECEL_TIMEOUT     80000u    /* ticks (~4 s) max braking */
+#define IMECH_COAST_TIMEOUT     80000u    /* ticks (~4 s) max coast */
 #define IMECH_ABORT_RPM         1000.0f   /* safety: abort if rotor exceeds this */
+#define IMECH_SPD_SETTLE_TICKS  50000u    /* 2.5 s settle per target speed */
+#define IMECH_SPD_RECORD_TICKS  10000u    /* last 0.5 s averaged */
+#define IMECH_SPD_IQ_MAX        2.0f      /* local speed-PI output clamp [A] */
+#define IMECH_SPD_KP            0.005f    /* conservative P gain (A/rpm) */
+#define IMECH_SPD_KI            0.02f     /* A/(rpm*s) — slow integrator */
 
-static const float imech_gates_rpm[IMECH_N_GATES] = {
-  100.0f, 200.0f, 300.0f, 400.0f, 500.0f, 600.0f
+static const float imech_spd_targets_rpm[IMECH_SPD_N_TARGETS] = {
+  200.0f, 300.0f, 400.0f, 500.0f
 };
 
 /* Phase helpers — range-test the contiguous ident_phase_t order. */
@@ -325,58 +338,57 @@ static void ident_update(motor_t *motor) {
   }
 }
 
-/* Compute J/B/Tc from the recorded gate-crossing times. Per band [g_i, g_i+1]:
- *   a_up = dw/dt_up,  a_dn = dw/dt_dn  (both magnitudes)
- *   J    = 2*Te/(a_up + a_dn)        -> friction cancels at matched speed
- *   f    = J*(a_dn - a_up)/2         -> friction torque at the band midpoint
- * J is averaged over bands; f(omega) is least-squares fit -> B (slope), Tc. */
+/* Compute J/B/Tc from the recorded data.
+ *  B/Tc first: least-squares fit Kt*iq = B*w + Tc over the settled speed
+ *     points — purely steady-state averages, immune to transients by
+ *     construction.
+ *  J: coast-down 400 -> 200 rpm with iq = 0. With zero current  J*a = f(w),
+ *     so  J = f(w_mid) * dt / dw  using the fitted B/Tc. No current reversal,
+ *     no sign flip, and the PLL's constant acceleration lag cancels in the
+ *     time difference of a steady coast. */
 static void imech_compute(motor_t *motor) {
   imech_ctx_t *m = &motor->imech;
-  float te = m->kt * m->iq_test;
 
-  float j_sum = 0.0f;
-  uint32_t j_n = 0u;
-  float sx = 0.0f, sy = 0.0f, sxx = 0.0f, sxy = 0.0f;  /* for f = B*w + Tc */
+  /* --- B/Tc (steady-state least squares through offset Tc) --- */
+  float sx = 0.0f, sy = 0.0f, sxx = 0.0f, sxy = 0.0f;
   uint32_t fn = 0u;
-
-  for (uint32_t i = 0u; i + 1u < IMECH_N_GATES; i++) {
-    float dw = (imech_gates_rpm[i + 1u] - imech_gates_rpm[i]) * FOC_RPM_TO_RAD;
-    float dt_up = (float)(m->t_up[i + 1u] - m->t_up[i]) * CONTROL_DT;
-    float dt_dn = (float)(m->t_dn[i] - m->t_dn[i + 1u]) * CONTROL_DT;
-    if (dt_up <= 0.0f || dt_dn <= 0.0f) {
-      continue;
-    }
-    float a_up = dw / dt_up;
-    float a_dn = dw / dt_dn;
-    if ((a_up + a_dn) <= 0.0f) {
-      continue;
-    }
-    float jb = 2.0f * te / (a_up + a_dn);              /* kg*m^2 */
-    float wm = (imech_gates_rpm[i + 1u] + imech_gates_rpm[i]) * 0.5f * FOC_RPM_TO_RAD;
-    float fb = jb * (a_dn - a_up) * 0.5f;              /* Nm */
-    j_sum += jb;
-    j_n++;
-    sx += wm; sy += fb; sxx += wm * wm; sxy += wm * fb; fn++;
-  }
-
-  if (j_n > 0u) {
-    m->j = (j_sum / (float)j_n) * 1.0e7f;              /* kg*m^2 -> g*cm^2 */
+  for (uint32_t i = 0u; i < m->n_pts; i++) {
+    float w = m->w_pts[i];
+    float y = m->kt * m->iq_pts[i];
+    sx += w; sy += y; sxx += w * w; sxy += w * y; fn++;
   }
   if (fn >= 2u) {
     float denom = (float)fn * sxx - sx * sx;
     if (denom > 1.0e-9f || denom < -1.0e-9f) {
       float bb = ((float)fn * sxy - sx * sy) / denom;  /* Nm*s/rad */
       float tcb = (sy - bb * sx) / (float)fn;          /* Nm */
-      m->b = bb * 1.0e6f;                              /* -> uNm*s/rad */
-      m->tc = tcb * 1.0e3f;                            /* -> mNm */
+      /* Physical sanity: viscous friction B and Coulomb friction Tc cannot be
+       * negative. A negative fit is a measurement artefact; clamp to 0 and
+       * flag the result so the operator is warned (identinfo) and the deployed
+       * speed-loop Ki is not destabilising. */
+      m->friction_valid = (bb >= 0.0f && tcb >= 0.0f) ? 1u : 0u;
+      m->b  = (bb  >= 0.0f) ? bb  * 1.0e6f : 0.0f;     /* -> uNm*s/rad */
+      m->tc = (tcb >= 0.0f) ? tcb * 1.0e3f : 0.0f;     /* -> mNm */
     }
+  }
+
+  /* --- J (coast-down, needs the B/Tc fit above) --- */
+  float w_mid = (IMECH_COAST_HI + IMECH_COAST_LO) * 0.5f * FOC_RPM_TO_RAD;
+  float f_avg = m->b * 1.0e-6f * w_mid + m->tc * 1.0e-3f;   /* Nm */
+  float dw_c = (m->rpm_coast_hi - m->rpm_coast_lo) * FOC_RPM_TO_RAD;
+  float dt_c = (float)(m->t_coast_lo - m->t_coast_hi) * CONTROL_DT;
+  if (dw_c > 0.0f && dt_c > 0.0f && f_avg > 0.0f) {
+    m->j = (f_avg * dt_c / dw_c) * 1.0e7f;                 /* kg*m^2 -> g*cm^2 */
   }
 }
 
-/* Advance the mechanical-identification state machine (FOC_STATE_IMECH). Spins
- * the rotor with +Iq up through the speed gates, then -Iq back down, recording
- * the crossing times; the rate difference between the two directions yields J
- * and the friction model. iq_ref is consumed by foc_imech_run's current loop. */
+/* Advance the mechanical-identification state machine (FOC_STATE_IMECH).
+ *  J phase: constant +Iq / -Iq, timestamp the 100 and 500 rpm crossings; a
+ *  settle guard on each current transition keeps the timestamps clean.
+ *  SPD_STEP: a conservative local PI speed loop holds each target speed for a
+ *  fixed settle window; the tail of the window is averaged into (w, iq) so the
+ *  steady-state fit is immune to the approach transient. iq_ref is consumed by
+ *  foc_imech_run's current loop. */
 static void imech_update(motor_t *motor) {
   imech_ctx_t *m = &motor->imech;
   float rpm = fabsf(motor->actual.rpm);
@@ -384,40 +396,98 @@ static void imech_update(motor_t *motor) {
   m->timeout++;
 
   switch (m->phase) {
-  case IMECH_ACCEL:
+  case IMECH_J_UP:
     m->iq_ref = m->iq_test;                 /* +torque, natural direction */
-    if (m->idx < (int32_t)IMECH_N_GATES && rpm >= imech_gates_rpm[m->idx]) {
-      m->t_up[m->idx] = m->tick;
-      m->idx++;
+    if (m->j_settle < IMECH_J_START_SETTLE_TICKS) {
+      m->j_settle++;                        /* let the current rise first */
+      break;
     }
-    if (m->idx >= (int32_t)IMECH_N_GATES) { /* crossed the top gate */
-      m->idx = (int32_t)IMECH_N_GATES - 1;  /* first downward gate to look for */
+    if (rpm >= IMECH_J_TOP) {
+      m->t_j_hi = m->tick;
+      m->j_hi_done = 1u;
+      m->iq_ref = 0.0f;                     /* cut current -> free coast */
       m->timeout = 0u;
-      m->phase = IMECH_DECEL;
+      m->phase = IMECH_J_COAST;
     } else if (m->timeout >= IMECH_ACCEL_TIMEOUT || rpm > IMECH_ABORT_RPM) {
       m->iq_ref = 0.0f;                      /* could not reach top / too fast */
       m->phase = IMECH_DONE;
     }
     break;
 
-  case IMECH_DECEL:
-    m->iq_ref = -m->iq_test;                 /* active braking */
-    if (m->idx >= 0 && rpm <= imech_gates_rpm[m->idx]) {
-      m->t_dn[m->idx] = m->tick;
-      m->idx--;
+  case IMECH_J_COAST:
+    m->iq_ref = 0.0f;                        /* pure coast: J*a = f(w) */
+    if (!m->coast_hi_done && rpm <= IMECH_COAST_HI) {
+      m->t_coast_hi = m->tick;
+      m->rpm_coast_hi = rpm;
+      m->coast_hi_done = 1u;
     }
-    if (m->idx < 0) {                        /* crossed the bottom gate */
-      m->iq_ref = 0.0f;                      /* stop driving, coast to rest */
-      imech_compute(motor);
-      m->phase = IMECH_DONE;
-    } else if (m->timeout >= IMECH_DECEL_TIMEOUT) {
-      m->iq_ref = 0.0f;
+    if (m->coast_hi_done && rpm <= IMECH_COAST_LO) {
+      m->t_coast_lo = m->tick;
+      m->rpm_coast_lo = rpm;
+      m->idx = 0;
+      m->target_rpm = imech_spd_targets_rpm[0];
+      m->settle_tick = 0u;
+      m->sum_w = 0.0f;
+      m->sum_iq = 0.0f;
+      m->n = 0u;
+      m->spd_int = 0.0f;
+      m->timeout = 0u;
+      m->phase = IMECH_SPD_STEP;
+    } else if (m->timeout >= IMECH_COAST_TIMEOUT) {
       m->phase = IMECH_DONE;
     }
     break;
 
+  case IMECH_SPD_STEP: {
+    if (m->idx >= (int32_t)IMECH_SPD_N_TARGETS) {
+      m->phase = IMECH_DONE;
+      imech_compute(motor);
+      m->iq_ref = 0.0f;
+      break;
+    }
+    /* Local conservative speed PI (A/rpm) feeding the current loop. */
+    {
+      float err = m->target_rpm - motor->actual.rpm;
+      m->spd_int += m->spd_ki * err * CONTROL_DT;
+      if (m->spd_int > IMECH_SPD_IQ_MAX) { m->spd_int = IMECH_SPD_IQ_MAX; }
+      if (m->spd_int < -IMECH_SPD_IQ_MAX) { m->spd_int = -IMECH_SPD_IQ_MAX; }
+      float iq = m->spd_kp * err + m->spd_int;
+      if (iq > IMECH_SPD_IQ_MAX) { iq = IMECH_SPD_IQ_MAX; }
+      if (iq < -IMECH_SPD_IQ_MAX) { iq = -IMECH_SPD_IQ_MAX; }
+      m->iq_ref = iq;
+    }
+    /* Record the tail of the settle window (steady state). */
+    m->settle_tick++;
+    if (m->settle_tick > IMECH_SPD_SETTLE_TICKS - IMECH_SPD_RECORD_TICKS) {
+      m->sum_w += motor->actual.rpm * FOC_RPM_TO_RAD;
+      m->sum_iq += m->iq_ref;
+      m->n++;
+    }
+    if (m->settle_tick >= IMECH_SPD_SETTLE_TICKS) {
+      if (m->n > 0u) {
+        m->w_pts[m->idx] = m->sum_w / (float)m->n;
+        m->iq_pts[m->idx] = m->sum_iq / (float)m->n;
+        m->n_pts++;
+      }
+      m->idx++;
+      if (m->idx < (int32_t)IMECH_SPD_N_TARGETS) {
+        m->target_rpm = imech_spd_targets_rpm[m->idx];
+        m->settle_tick = 0u;
+        m->sum_w = 0.0f;
+        m->sum_iq = 0.0f;
+        m->n = 0u;
+      } else {
+        m->phase = IMECH_DONE;
+        imech_compute(motor);
+        m->iq_ref = 0.0f;
+      }
+    }
+    break;
+  }
+
   case IMECH_DONE:
   default:
+    m->iq_ref = 0.0f;
     foc_set_state(motor, FOC_STATE_IDLE);
     break;
   }
@@ -456,20 +526,34 @@ void foc_start_ident(motor_t *motor) {
 
 void foc_start_identmech(motor_t *motor, float kt, float iq_test) {
   imech_ctx_t *m = &motor->imech;
-  m->phase = IMECH_ACCEL;
+  m->phase = IMECH_J_UP;
   m->kt = kt;
   m->iq_test = iq_test;
   m->iq_ref = 0.0f;
   m->tick = 0u;
   m->timeout = 0u;
   m->idx = 0;
-  for (uint32_t i = 0u; i < IMECH_N_GATES; i++) {
-    m->t_up[i] = 0u;
-    m->t_dn[i] = 0u;
-  }
+  m->t_j_hi = 0u;
+  m->t_coast_hi = 0u;
+  m->t_coast_lo = 0u;
+  m->rpm_coast_hi = 0.0f;
+  m->rpm_coast_lo = 0.0f;
+  m->j_hi_done = 0u;
+  m->coast_hi_done = 0u;
+  m->j_settle = 0u;
+  m->target_rpm = imech_spd_targets_rpm[0];
+  m->spd_kp = IMECH_SPD_KP;
+  m->spd_ki = IMECH_SPD_KI;
+  m->spd_int = 0.0f;
+  m->settle_tick = 0u;
+  m->sum_w = 0.0f;
+  m->sum_iq = 0.0f;
+  m->n = 0u;
+  m->n_pts = 0u;
   m->j = 0.0f;
   m->b = 0.0f;
   m->tc = 0.0f;
+  m->friction_valid = 0u;   /* set by imech_compute after a plausible fit */
   foc_set_state(motor, FOC_STATE_IMECH);
 }
 

@@ -259,7 +259,12 @@ void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
   }
 
   // --- Phase loss: commanding torque but no current flows, sustained -----
-  if (driving && fabsf(iq_cmd) > FAULT_PHASELOSS_IQCMD &&
+  // Speed-gated: at high RPM a voltage-saturated drive legitimately measures
+  // near-zero phase current (the bus cannot push voltage against the
+  // back-EMF), which is not an open phase. A real disconnection lets the
+  // rotor spin down, so the detector arms only while the rotor is stopped.
+  if (driving && fabsf(rpm) < FAULT_PHASELOSS_RPM &&
+      fabsf(iq_cmd) > FAULT_PHASELOSS_IQCMD &&
       fabsf(iu) < FAULT_PHASELOSS_I && fabsf(iv) < FAULT_PHASELOSS_I) {
     if (s_phaseloss_since == 0u) s_phaseloss_since = tick_ms ? tick_ms : 1u;
     if ((tick_ms - s_phaseloss_since) >= FAULT_PHASELOSS_MS) {
