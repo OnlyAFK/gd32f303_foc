@@ -82,6 +82,8 @@ static const kv_field_t s_fields[] = {
   KV_F("spd_lim",   spd_limit,          PT_F32),
   KV_F("spd_acc",   spd_accel,          PT_F32),
   KV_F("regen_mrg", regen_margin,       PT_F32),
+  KV_F("ff_en",     ff_en,              PT_U8),
+  KV_F("dcpl_en",   decouple_en,        PT_U8),
   KV_F("pos_rpm",   pos_max_rpm,        PT_F32),
   KV_F("pos_acc",   pos_max_accel,      PT_F32),
   KV_F("pos_jerk",  pos_max_jerk,       PT_F32),
@@ -200,6 +202,8 @@ static void params_from_motor(params_t *p, const motor_t *m) {
   p->spd_limit       = m->ctrl.speed.out_max;
   p->spd_accel       = m->spd_accel;
   p->regen_margin    = m->regen_margin;
+  p->ff_en           = m->ff_en;
+  p->decouple_en     = m->decouple_en;
   p->mit_kt          = m->mit_kt;
   p->mit_cur_lim     = m->mit_cur_lim;
   p->pos_max_rpm     = m->ctrl.pos.max_rpm;
@@ -223,6 +227,8 @@ static void params_to_motor(const params_t *p, motor_t *m) {
 
   m->spd_accel     = p->spd_accel;
   m->regen_margin  = p->regen_margin;
+  m->ff_en         = p->ff_en;
+  m->decouple_en   = p->decouple_en;
 
   /* MIT torque constant: use the user-set value, else derive from the
    * identified flux (Kt = 1.5 * pole_pairs * flux). foc_set_state re-derives

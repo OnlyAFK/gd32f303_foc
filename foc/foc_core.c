@@ -37,6 +37,16 @@
  * from kicking through the hardware overvoltage trip. */
 #define DEFAULT_REGEN_MARGIN    4.0f
 
+/* Feed-forward defaults (P0): the identified J/B/Tc and Ld/Lq/flux finally
+ * enter the control loops. Both are inert (zero contribution) until the
+ * relevant ident has produced the parameters, so a fresh board behaves exactly
+ * like the pure-feedback version. */
+#define DEFAULT_FF_EN           1u
+#define DEFAULT_DECOUPLE_EN     1u
+/* Coulomb-friction FF deadband [rad/s]: below this speed the Tc*sign(w) term is
+ * zeroed so the sign() term cannot dither the torque command around standstill. */
+#define FF_FRIC_DEAD_RAD_S      3.0f
+
 /* MIT torque-current ceiling [A]; 0 = follow cur_limit. Default equals
  * DEFAULT_SPEED_LIMIT: 12 A at 24 V pulls ~288 W, and on the bench that
  * collapsed the supply rail into DRV UVLO (VM < ~5.6 V) during a stalled /
@@ -321,6 +331,14 @@ void foc_init(motor_t *motor) {
   motor->spd_accel    = DEFAULT_SPD_ACCEL;
   motor->regen_margin = DEFAULT_REGEN_MARGIN;
 
+  /* Feed-forward starts enabled; params_init() may override from flash. The
+   * loops stay inert until the corresponding ident has run (mech_valid /
+   * ident_valid), so defaults are safe on a fresh board. */
+  motor->ff_en        = DEFAULT_FF_EN;
+  motor->decouple_en  = DEFAULT_DECOUPLE_EN;
+  motor->prev_rpm_ref = 0.0f;
+  motor->iq_ff        = 0.0f;
+
   /* MIT impedance control starts inert: no command, no Kt. params_init() will
    * set mit_kt (if stored) and derive mit_effective_kt from flux (if any). */
   motor->mit_cmd.active   = 0;
@@ -377,6 +395,10 @@ void foc_set_state(motor_t *motor, foc_state_t state) {
       motor->target.rpm  = 0.0f;
       motor->spd_cmd_rpm = 0.0f;
     }
+    /* Seed the accel-FF difference base to the (zeroed) reference so the first
+     * speed-loop tick does not diff against a stale previous-mode target. */
+    motor->prev_rpm_ref = 0.0f;
+    motor->iq_ff        = 0.0f;
     motor_hw_enable_driver();
     break;
 
@@ -396,6 +418,11 @@ void foc_set_state(motor_t *motor, foc_state_t state) {
     motor->ctrl.pos.last_target_pos = motor->ctrl.pos.current_pos;
     motor->ctrl.pos.last_output_rpm = 0.0f;
     motor->target.pos               = motor->ctrl.pos.current_pos;
+    /* The profiler's first output is 0 (error and delta_target are both 0), so
+     * the accel-FF difference base must start at 0 too — otherwise the first
+     * speed-loop tick diffs against a stale previous-mode target. */
+    motor->prev_rpm_ref = 0.0f;
+    motor->iq_ff        = 0.0f;
     motor_hw_enable_driver();
     break;
 
@@ -750,6 +777,12 @@ void foc_control_loop(motor_t *motor) {
     motor->speed_loop_cnt = 0;
 
     if (motor->state == FOC_STATE_SPEED || motor->state == FOC_STATE_POSITION) {
+      /* Snapshot the speed reference of the previous speed-loop tick before the
+       * ramp/profiler advances it: the accel feed-forward term is the plain
+       * 1 kHz difference of this deterministic reference (slew ramp in SPEED,
+       * S-curve profiler in POSITION) — no noise, no numerical derivative. */
+      float prev_rpm_ref = motor->prev_rpm_ref;
+
       /* Speed slew ramp — SPEED mode only; POSITION's profiler already wrote
        * target.rpm at step 6. When spd_accel==0, track the command instantly
        * (backward compatible with the old direct-write behaviour). */
@@ -769,7 +802,45 @@ void foc_control_loop(motor_t *motor) {
         }
       }
 
-      motor->target.iq = pi_calc(&motor->ctrl.speed, motor->target.rpm, motor->actual.rpm);
+      float a_ref_rad_s2 = (motor->target.rpm - prev_rpm_ref) /
+                           (CONTROL_DT * (float)HW_SPEED_LOOP_DIV) * FOC_RPM_TO_RAD;
+      motor->prev_rpm_ref = motor->target.rpm;
+
+      float iq_cmd = pi_calc(&motor->ctrl.speed, motor->target.rpm, motor->actual.rpm);
+      motor->iq_ff = 0.0f;
+
+      /* Accel + friction torque feed-forward (P0): iq_ff = (J*a_ref + B*w +
+       * Tc*sign(w)) / Kt, all in SI. The B*w and Tc terms use the MEASURED
+       * speed (they compensate real motion); Tc gets a deadband around
+       * standstill so sign() cannot dither the command. Inert until the
+       * mechanical ident produced J/B/Tc and flux. */
+      if (motor->ff_en) {
+        const params_t *p = params_get();
+        if (p->mech_valid != 0u && p->inertia_j > 0.0f && p->flux > 0.0f) {
+          float kt = 1.5f * (float)HW_MOTOR_POLE_PAIRS * (p->flux * 1.0e-3f);
+          if (kt > 1.0e-9f) {
+            float j_si   = p->inertia_j   * 1.0e-7f;
+            float b_si   = p->visc_b      * 1.0e-6f;
+            float tc_si  = p->friction_tc * 1.0e-3f;
+            if (b_si < 0.0f) b_si = 0.0f;   /* defensive: a negative fit must not feed back */
+            if (tc_si < 0.0f) tc_si = 0.0f;
+            float w_rad = motor->ctrl.speed_pll.speed_rad_s;
+            float fric_ff = 0.0f;
+            if (w_rad > FF_FRIC_DEAD_RAD_S)       fric_ff =  tc_si;
+            else if (w_rad < -FF_FRIC_DEAD_RAD_S) fric_ff = -tc_si;
+
+            motor->iq_ff = (j_si * a_ref_rad_s2 + b_si * w_rad + fric_ff) / kt;
+            iq_cmd += motor->iq_ff;
+          }
+        }
+      }
+
+      /* Clamp the final torque current to the speed-loop output ceiling
+       * (spd_limit): the feed-forward must not be able to demand more current
+       * than the loop itself is allowed to. */
+      if (iq_cmd >  motor->ctrl.speed.out_max) iq_cmd =  motor->ctrl.speed.out_max;
+      if (iq_cmd <  motor->ctrl.speed.out_min) iq_cmd =  motor->ctrl.speed.out_min;
+      motor->target.iq = iq_cmd;
     }
   }
 
@@ -855,6 +926,24 @@ void foc_control_loop(motor_t *motor) {
 
       vd_out = pi_calc(&motor->ctrl.id, motor->target.id, motor->actual.id);
       vq_out = pi_calc(&motor->ctrl.iq, iq_cmd, motor->actual.iq);
+
+      /* dq cross-coupling decoupling feed-forward (P0): at speed the rotation
+       * induces -we*Lq*Iq on the d axis and we*(Ld*Id+psi) on the q axis; the
+       * current-loop PIs otherwise fight these purely by feedback. Only in the
+       * closed-loop current states (this switch arm) — the calibration/ident
+       * sub-machines never pass through here, so they stay untouched. Inert
+       * until the electrical ident has produced Ld/Lq/flux. */
+      if (motor->decouple_en) {
+        const params_t *p = params_get();
+        if (p->ident_valid != 0u && p->ld > 0.0f && p->lq > 0.0f && p->flux > 0.0f) {
+          float omega_e = motor->ctrl.speed_pll.speed_rad_s * (float)HW_MOTOR_POLE_PAIRS;
+          float ld_si   = p->ld * 1.0e-6f;
+          float lq_si   = p->lq * 1.0e-6f;
+          float psi_si  = p->flux * 1.0e-3f;
+          vd_out += -omega_e * lq_si * motor->actual.iq;
+          vq_out +=  omega_e * (ld_si * motor->actual.id + psi_si);
+        }
+      }
     }
     break;
 

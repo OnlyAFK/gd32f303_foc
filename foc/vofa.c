@@ -60,4 +60,6 @@ void vofa_update_from_motor(motor_t *motor) {
 
   vofa_data[VOFA_CH_SPEED_ACTUAL] = motor->actual.rpm;
   vofa_data[VOFA_CH_SPEED_TARGET] = motor->target.rpm;
+
+  vofa_data[VOFA_CH_IQ_FF] = motor->iq_ff;
 }

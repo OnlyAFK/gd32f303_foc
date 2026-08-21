@@ -30,6 +30,7 @@ enum {
   VOFA_CH_DEBUG, // 20
   VOFA_CH_SPEED_ACTUAL,
   VOFA_CH_SPEED_TARGET,
+  VOFA_CH_IQ_FF,        // accel+friction feed-forward torque current [A]
 };
 
 extern float vofa_data[VOFA_CHANNEL_CNT];

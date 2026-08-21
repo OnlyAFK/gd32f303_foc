@@ -155,6 +155,15 @@ struct motor_s {
   float spd_accel;        /* speed slew rate [rpm/s]; 0 = instant (backward compatible) */
   float regen_margin;     /* V margin below ov_trip to begin regen limiting */
 
+  /* Feed-forward (P0): accel+friction torque FF into the speed loop and dq
+   * cross-coupling decoupling at the current loop. The enable switches are
+   * params-driven (ff_en / dcpl_en, default on; inert until the relevant ident
+   * has run); prev_rpm_ref and iq_ff are ISR state written by the speed loop. */
+  uint8_t ff_en;          /* 1: iq_ff = (J*a_ref + B*w + Tc*sign(w)) / Kt, SPEED/POSITION */
+  uint8_t decouple_en;    /* 1: Vd_ff = -we*Lq*Iq, Vq_ff = we*(Ld*Id+psi), closed-loop current */
+  float   prev_rpm_ref;   /* target.rpm of the last speed-loop tick (accel diff) */
+  float   iq_ff;          /* last feed-forward torque current [A] (telemetry) */
+
   float vdc;
   uint32_t pwm_period;
 

@@ -19,6 +19,49 @@ Entry template:
 
 ---
 
+## P0: accel+friction feed-forward and dq cross-coupling decoupling — 2026-08-19
+### What
+- **Accel + friction torque feed-forward** (FEATURE_BACKLOG 2.1): the speed loop
+  now superimposes `iq_ff = (J*a_ref + B*w + Tc*sign(w)) / Kt` on its PI output
+  in SPEED/POSITION modes. `a_ref` is the plain 1 kHz difference of the speed
+  reference (slew ramp / position profiler — deterministic, no noise); the B*w
+  and Tc terms use the measured PLL speed, and Tc gets a deadband around
+  standstill (`FF_FRIC_DEAD_RAD_S` = 3 rad/s) so sign() cannot dither the
+  command at rest. The total is clamped to ±`spd_limit`.
+- **dq cross-coupling decoupling** (FEATURE_BACKLOG 2.2): the current loop adds
+  `Vd_ff = -we*Lq*Iq` and `Vq_ff = we*(Ld*Id+psi)` after the PI outputs, in
+  CURRENT/SPEED/POSITION/MIT only (calibration/ident sub-machines untouched).
+- New persistent params `ff_en` and `dcpl_en` (both default 1). Both loops are
+  **inert until the relevant ident has run** (mech_valid/ident_valid gates), so
+  a fresh board behaves exactly like the previous pure-feedback firmware.
+- New VOFA scope channel `iq_ff` (channel 23) — the feed-forward torque current,
+  now also listed in `dump`.
+- Version bumped 0.2.18 -> 0.2.19 (PATCH: two new params, stored values kept).
+### Why
+- J/B/Tc and Ld/Lq/flux have been identified for two releases but never entered
+  the control loops: the speed loop alone fights acceleration drag and
+  friction, and the current loops fight the rotation-induced dq coupling purely
+  by feedback. Fast moves show tracking lag; high speed shows degraded current
+  dynamics.
+### How to use
+- A/B compare with `set ff_en 0|1` / `set dcpl_en 0|1` (apply live, `save` to
+  persist).
+- FF: `mode speed` + `speed 800` step/ramp, watch `speed_actual` vs
+  `speed_target` and `iq_ff`; `mode position` + a fast move for peak tracking
+  error.
+- Decoupling: at 800–1200 rpm (bus-limited ceiling ~1600 rpm on 24 V),
+  `dqavg 1000` — the steady-state `id` mean should sit closer to 0 with
+  `dcpl_en 1`, and `id`/`iq` ripple in scope drops.
+### Notes / follow-ups
+- In the voltage-limited regime both feed-forwards still help, but their effect
+  is capped by the available bus voltage.
+- `a_ref` comes from the reference difference; direct writes to `target.rpm`
+  without a ramp would produce a step spike — clamped by `spd_limit`, and
+  `spd_acc` is the intended way to shape SPEED-mode moves.
+- FEATURE_BACKLOG 2.1 / 2.2 removed from the list after bench verification.
+
+---
+
 ## Control hardening for voltage-limited high-speed operation — 2026-08-19
 ### What
 - `pi_calc()` gains conditional-integration anti-windup: the integrator freezes

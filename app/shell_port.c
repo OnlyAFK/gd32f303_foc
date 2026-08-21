@@ -15,8 +15,8 @@
 #include "can.h"
 #include "can_proto.h"
 
-// Number of VOFA channels streamed in scope mode (channels 0..SPEED_TARGET).
-#define SCOPE_CHANNELS  (VOFA_CH_SPEED_TARGET + 1)
+// Number of VOFA channels streamed in scope mode (channels 0..IQ_FF).
+#define SCOPE_CHANNELS  (VOFA_CH_IQ_FF + 1)
 
 // letter-shell splits this buffer across the edit line + SHELL_HISTORY_MAX_NUMBER
 // history slots (shell.c: bufferSize = size / (HISTORY+1)). With 5 history slots
@@ -512,9 +512,9 @@ static int cmd_dump(int argc, char *argv[]) {
     "vd", "vq", "mech_theta", "svpwm_alpha", "svpwm_beta",
     "ccr1", "ccr2", "ccr3", "sector", "iu", "iv", "iw",
     "i_alpha", "i_beta", "id", "iq", "id_ref", "iq_ref",
-    "pos_target", "pos_actual", "debug", "speed_actual", "speed_target",
+    "pos_target", "pos_actual", "debug", "speed_actual", "speed_target", "iq_ff",
   };
-  for (int i = 0; i <= VOFA_CH_SPEED_TARGET; i++) {
+  for (int i = 0; i <= VOFA_CH_IQ_FF; i++) {
     print_f(names[i], vofa_data[i]);
   }
   return 0;

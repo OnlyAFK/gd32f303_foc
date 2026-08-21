@@ -64,6 +64,13 @@ typedef struct {
   float   spd_accel;         /* speed slew rate [rpm/s]; 0 = instant step */
   float   regen_margin;      /* V margin below OV trip to begin regen limiting */
 
+  /* --- feed-forward (P0): accel+friction FF and dq decoupling ---
+   * Both are inert until the corresponding ident has run (the loops check
+   * mech_valid / ident_valid), so the default-on state is safe on a fresh
+   * board. */
+  uint8_t ff_en;             /* 1: torque FF iq_ff=(J*a+B*w+Tc*sign(w))/Kt into the speed loop (SPEED/POSITION) */
+  uint8_t decouple_en;       /* 1: dq decoupling Vd_ff=-we*Lq*Iq, Vq_ff=we*(Ld*Id+psi) at the current loop */
+
   /* --- protection thresholds (VESC-style guard lives in fault.c) --- */
   fault_cfg_t thr;
 
