@@ -105,8 +105,9 @@ typedef enum {
 #define FAULT_PHASELOSS_MS    500u
 
 /* Debounce windows for the 1 ms background monitor (in ms). */
-#define FAULT_UV_DEBOUNCE_MS  200u
-#define FAULT_OV_DEBOUNCE_MS  20u
+#define FAULT_UV_DEBOUNCE_MS       200u
+#define FAULT_OV_DEBOUNCE_MS       20u
+#define FAULT_ENCODER_DEBOUNCE_MS  100u  /* echo must read bad continuously this long */
 
 /* Independent watchdog timeout (ms). The background loop must feed it faster
  * than this or the MCU resets (and PWM stops). */

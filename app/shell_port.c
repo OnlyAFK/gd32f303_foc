@@ -492,6 +492,7 @@ static int cmd_status(int argc, char *argv[]) {
   print_fault_names(f->latched);
   shellPrint(&s_shell, "\r\nDRV FS1=0x%03x FS2=0x%03x\r\n",
              (unsigned)f->drv_fs1, (unsigned)f->drv_fs2);
+  shellPrint(&s_shell, "enc echo=0x%04x\r\n", (unsigned)motor_hw_encoder_cmd_echo());
 
   /* Encoder config read-back (init): fast filter + prediction + autocal
    * mode 1 expected. A mismatch that could not be corrected means a different

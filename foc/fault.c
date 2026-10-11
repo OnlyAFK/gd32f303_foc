@@ -29,6 +29,7 @@ static uint32_t s_uv_since;        // tick when bus first went under-voltage (0 
 static uint32_t s_ov_since;        // tick when bus first went over-voltage  (0 = ok)
 static uint32_t s_stall_since;     // tick when the stall condition began    (0 = ok)
 static uint32_t s_phaseloss_since; // tick when the phase-loss condition began(0 = ok)
+static uint32_t s_enc_since;       // tick when the encoder bus first read bad (0 = ok)
 static uint32_t s_i2t_last_tick;   // previous tick for the I^2 t dt
 static float    s_i2t_accum;       // A^2 * s accumulated above continuous
 
@@ -76,6 +77,7 @@ void fault_init(void) {
   s_ov_since = 0u;
   s_stall_since = 0u;
   s_phaseloss_since = 0u;
+  s_enc_since = 0u;
   s_i2t_last_tick = 0u;
   s_i2t_accum = 0.0f;
 
@@ -274,12 +276,20 @@ void fault_monitor_slow(float vbus, float iq, float iq_cmd, float rpm,
     s_phaseloss_since = 0u;
   }
 
-  // --- Encoder bus health ------------------------------------------------
-  // Reliably catches an encoder bus that is dead from bring-up. NOTE: a
-  // *mid-run* disconnect is not caught here yet — add a "frozen angle while
-  // commanding motion" check in the HAL if needed.
+  // --- Encoder bus health (debounced) ------------------------------------
+  // Reliably catches an encoder bus that is dead from bring-up. Debounced:
+  // the echo is a single 16-bit sample per 20 kHz read, and PWM switching can
+  // corrupt an occasional one — a lone bad sample must not kill the drive, so
+  // the bus must read bad continuously for FAULT_ENCODER_DEBOUNCE_MS before
+  // tripping. NOTE: a *mid-run* disconnect is only caught by this echo; add a
+  // "frozen angle while commanding motion" check in the HAL if needed.
   if (!motor_hw_encoder_ok()) {
-    fault_raise(FAULT_ENCODER, vbus, iq);
+    if (s_enc_since == 0u) s_enc_since = tick_ms ? tick_ms : 1u;
+    if ((tick_ms - s_enc_since) >= FAULT_ENCODER_DEBOUNCE_MS) {
+      fault_raise(FAULT_ENCODER, vbus, iq);
+    }
+  } else {
+    s_enc_since = 0u;
   }
 }
 
@@ -315,6 +325,7 @@ bool fault_try_clear(float vbus) {
   s_ov_since = 0u;
   s_stall_since = 0u;
   s_phaseloss_since = 0u;
+  s_enc_since = 0u;
   s_i2t_accum = 0.0f;
 
   // Make sure the driver is configured and its latched bits are cleared even if
